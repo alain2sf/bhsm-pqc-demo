@@ -1,0 +1,13 @@
+./go/pkg/mod/cache/download/sumdb/sum.golang.org/lookup/github.com/miekg
+./go/pkg/mod/cache/download/sumdb/sum.golang.org/lookup/github.com/miekg/dns@v1.1.67
+./go/pkg/mod/cache/download/sumdb/sum.golang.org/lookup/github.com/miekg/pkcs11@v1.1.2
+
+./go/pkg/mod/cache/download/github.com/miekg
+
+./go/pkg/mod/cache/download/github.com/miekg/pkcs11
+
+./go/pkg/mod/cache/download/github.com/miekg/dns
+
+./go/pkg/mod/github.com/miekg
+./go/pkg/mod/github.com/miekg/dns@v1.1.67
+./go/pkg/mod/github.com/miekg/pkcs11@v1.1.2
