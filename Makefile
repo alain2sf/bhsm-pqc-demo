@@ -7,7 +7,8 @@ CMD_PATH=./cmd/bhsm-pqc-demo
 MIN_GO_VERSION=go1.27.1
 
 export GO111MODULE=on
-export GOTOOLCHAIN=auto
+# Use the installed toolchain only: never download one on go.mod's request.
+export GOTOOLCHAIN=local
 
 # ============================================================================
 # HSM Connection Parameters
@@ -180,7 +181,7 @@ sym-enc: build
 	@echo -e "\n=== [7/8] Encrypting Payload (HKDF + AES-256-GCM Sender) ==="
 	@rm -f $(ENC_MSG_FILE)
 	@if [ ! -f $(PLAIN_MSG_FILE) ]; then \
-		echo -n "hello from the AES-256-GCM AEAD prototype using ML-KEM-768 key exchange" > $(PLAIN_MSG_FILE); \
+		(umask 077; echo -n "hello from the AES-256-GCM AEAD prototype using ML-KEM-768 key exchange" > $(PLAIN_MSG_FILE)); \
 	fi
 	@./$(BUILD_DIR)/$(BINARY_NAME) -sym-enc \
 	  -secret $(SENDER_SECRET) \
