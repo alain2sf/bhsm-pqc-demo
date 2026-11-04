@@ -302,6 +302,17 @@ make test
 
 Tests that need the HSM skip themselves when it isn't configured or can't be reached, so a plain `go test ./...` passes offline. `make test` exports `PKCS11_LIB_PATH` and `BOUNCY_HSM_CFG_STRING`, plus `HSM_TOKEN_LABEL`, `HSM_OBJECT_LABEL` and `HSM_PIN_FILE` (made absolute). With these, `TestLiveKeyPairVerification` logs in and checks the demo key pair on the live HSM. It is read-only: the temporary decapsulated key is destroyed.
 
+### Vulnerability Scan (`make vulncheck`)
+
+`make vulncheck` runs [`govulncheck`](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) over the whole module (`govulncheck ./...`), covering both the Go standard library and `github.com/miekg/pkcs11`. The tool is not managed by the project. Install it once, and update it with `go-global-update` like your other Go binaries:
+
+```bash
+go install golang.org/x/vuln/cmd/govulncheck@latest
+make vulncheck
+```
+
+The scan queries the Go vulnerability database, so it needs network access and is deliberately not part of `make build` or `make test`.
+
 ---
 
 ## 8. CLI Reference & Help Screen

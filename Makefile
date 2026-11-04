@@ -51,7 +51,7 @@ EXEC_HSM = BOUNCY_HSM_CFG_STRING="$(CFG_STRING)" \
            HSM_PIN_FILE="$(HSM_PIN_FILE)" \
            ./$(BUILD_DIR)/$(BINARY_NAME)
 
-.PHONY: all check-go-version build run test clean clean-artifacts show-secrets \
+.PHONY: all check-go-version build run test vulncheck clean clean-artifacts show-secrets \
         conn keygen extract-pk encap-hsm encap-pem decap verify \
         sym-enc sym-dec sym-verify demo
 
@@ -102,6 +102,12 @@ test: deps
 	@BOUNCY_HSM_CFG_STRING="$(CFG_STRING)" PKCS11_LIB_PATH="$(LIB_PATH)" \
 	 HSM_TOKEN_LABEL="$(HSM_TOKEN_LABEL)" HSM_OBJECT_LABEL="$(HSM_OBJECT_LABEL)" \
 	 HSM_PIN_FILE="$(abspath $(HSM_PIN_FILE))" go test -v ./...
+
+# Vulnerability scan (govulncheck is installed and updated separately, e.g. via go-global-update)
+vulncheck: check-go-version
+	@command -v govulncheck >/dev/null 2>&1 || { \
+		echo "[-] govulncheck not found. Install: go install golang.org/x/vuln/cmd/govulncheck@latest"; exit 1; }
+	govulncheck ./...
 
 # ----------------------------------------------------------------------------
 # ML-KEM Workflow Targets
@@ -176,7 +182,7 @@ show-secrets:
 # Symmetric AES-256-GCM Targets
 # ----------------------------------------------------------------------------
 
-# Encryption Using Sender Shaed Secret (HKDF derivation)
+# Encryption Using Sender Shared Secret (HKDF derivation)
 sym-enc: build
 	@echo -e "\n=== [7/8] Encrypting Payload (HKDF + AES-256-GCM Sender) ==="
 	@rm -f $(ENC_MSG_FILE)
@@ -189,7 +195,7 @@ sym-enc: build
 	  -in $(PLAIN_MSG_FILE) \
 	  -out $(ENC_MSG_FILE)
 
-# Decryption Using Receiver Shaed Secret (HKDF derivation)
+# Decryption Using Receiver Shared Secret (HKDF derivation)
 sym-dec: build
 	@echo -e "\n=== [8/8] Decrypting Payload (HKDF + AES-256-GCM Receiver) ==="
 	@rm -f $(DEC_MSG_FILE)
