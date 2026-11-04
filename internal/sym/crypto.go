@@ -30,10 +30,12 @@ const SharedSecretSize = 32
 // The GCM additional authenticated data is header || SHA-256(KEM ciphertext), so
 // the header cannot be altered and the payload only decrypts alongside the
 // ML-KEM ciphertext whose shared secret produced the key.
+const FormatVersion byte = 0x01
+
+// Sizes in bytes of the nonce and GCM tag in the payload layout above.
 const (
-	FormatVersion byte = 0x01
-	NonceSize          = 12
-	TagSize            = 16
+	NonceSize = 12
+	TagSize   = 16
 )
 
 // Header is the magic prefix and format version written at the start of every payload.

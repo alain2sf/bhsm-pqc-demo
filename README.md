@@ -313,6 +313,17 @@ make vulncheck
 
 The scan queries the Go vulnerability database, so it needs network access and is deliberately not part of `make build` or `make test`.
 
+### Static Analysis (`make staticcheck`)
+
+`make staticcheck` runs [`staticcheck`](https://staticcheck.dev) over the whole module (`staticcheck ./...`) with its default checks, on top of the `go vet` pass that `make build` already does. The tool is not managed by the project. Install it once, and update it with `go-global-update`. It must be built with a Go release at least as new as the one in `go.mod`, so reinstall it after upgrading Go:
+
+```bash
+go install honnef.co/go/tools/cmd/staticcheck@latest
+make staticcheck
+```
+
+It runs offline and is deliberately not part of `make build` or `make test`.
+
 ---
 
 ## 8. CLI Reference & Help Screen

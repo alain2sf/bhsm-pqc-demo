@@ -15,6 +15,7 @@ The Makefile sets a minimum Go version: `check-go-version` fails if the installe
 make build                     # tidy + vet + build bin/bhsm-pqc-demo
 make test                      # go test -v ./... with PKCS11_LIB_PATH and BOUNCY_HSM_CFG_STRING exported
 make vulncheck                 # govulncheck ./... (tool installed separately, updated via go-global-update; needs network)
+make staticcheck               # staticcheck ./... (tool installed separately, updated via go-global-update)
 make demo                      # full end-to-end pipeline (needs live HSM)
 make run ARGS="-c"             # run the binary with arbitrary flags and the HSM env vars set
 make clean                     # remove artifacts, test cache, bin/

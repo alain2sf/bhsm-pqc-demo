@@ -51,7 +51,7 @@ EXEC_HSM = BOUNCY_HSM_CFG_STRING="$(CFG_STRING)" \
            HSM_PIN_FILE="$(HSM_PIN_FILE)" \
            ./$(BUILD_DIR)/$(BINARY_NAME)
 
-.PHONY: all check-go-version build run test vulncheck clean clean-artifacts show-secrets \
+.PHONY: all check-go-version build run test vulncheck staticcheck clean clean-artifacts show-secrets \
         conn keygen extract-pk encap-hsm encap-pem decap verify \
         sym-enc sym-dec sym-verify demo
 
@@ -108,6 +108,13 @@ vulncheck: check-go-version
 	@command -v govulncheck >/dev/null 2>&1 || { \
 		echo "[-] govulncheck not found. Install: go install golang.org/x/vuln/cmd/govulncheck@latest"; exit 1; }
 	govulncheck ./...
+
+# Static analysis (staticcheck is installed and updated separately, e.g. via go-global-update).
+# It must be built with a Go release >= go.mod's; reinstall it after upgrading Go.
+staticcheck: check-go-version
+	@command -v staticcheck >/dev/null 2>&1 || { \
+		echo "[-] staticcheck not found. Install: go install honnef.co/go/tools/cmd/staticcheck@latest"; exit 1; }
+	staticcheck ./...
 
 # ----------------------------------------------------------------------------
 # ML-KEM Workflow Targets
