@@ -273,7 +273,7 @@ func runExport(o *options, libPath string) error {
 	}
 	defer client.Close()
 
-	if err := client.ExportPublicKeyPEM(tokenLabel, objectLabel, o.pubOut); err != nil {
+	if err := client.ExportPublicKeyPEM(tokenLabel, objectLabel, os.Getenv("HSM_PIN_FILE"), o.pubOut); err != nil {
 		return fmt.Errorf("public key export failed: %w", err)
 	}
 	return nil
@@ -309,7 +309,7 @@ func runEncap(o *options, libPath string) error {
 		}
 		defer client.Close()
 
-		k, err := client.FetchRawPublicKey(tokenLabel, objectLabel)
+		k, err := client.FetchRawPublicKey(tokenLabel, objectLabel, os.Getenv("HSM_PIN_FILE"))
 		if err != nil {
 			return fmt.Errorf("public key retrieval failed: %w", err)
 		}

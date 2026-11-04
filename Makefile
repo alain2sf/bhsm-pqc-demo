@@ -98,7 +98,9 @@ test: LIB_PATH := $(LIB_PATH)
 test: deps
 	@echo "[*] Running with PKCS11_LIB_PATH='$(LIB_PATH)'"
 	@echo "[*] Running with BOUNCY_HSM_CFG_STRING='$(CFG_STRING)'"
-	@BOUNCY_HSM_CFG_STRING="$(CFG_STRING)" PKCS11_LIB_PATH="$(LIB_PATH)" go test -v ./...
+	@BOUNCY_HSM_CFG_STRING="$(CFG_STRING)" PKCS11_LIB_PATH="$(LIB_PATH)" \
+	 HSM_TOKEN_LABEL="$(HSM_TOKEN_LABEL)" HSM_OBJECT_LABEL="$(HSM_OBJECT_LABEL)" \
+	 HSM_PIN_FILE="$(abspath $(HSM_PIN_FILE))" go test -v ./...
 
 # ----------------------------------------------------------------------------
 # ML-KEM Workflow Targets

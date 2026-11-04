@@ -7,9 +7,11 @@ import (
 	"crypto/mlkem"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/asn1"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -422,7 +424,14 @@ func (c *Client) GenerateMLKEMKeyPair(tokenLabel, objectLabel, pinFilePath, algo
 	return nil
 }
 
-func (c *Client) FetchRawPublicKey(tokenLabel, objectLabel string) ([]byte, error) {
+// FetchRawPublicKey reads the ML-KEM public key labelled objectLabel.
+//
+// With an empty pinFilePath it uses a public session and only checks that the
+// label is unambiguous. With a PIN file it logs in and also proves the public key
+// belongs to the private key of the same label (see verifyKeyPair). This matters
+// because the public object can be replaced without the PIN, and whoever holds
+// the matching private key could then read everything encrypted to it.
+func (c *Client) FetchRawPublicKey(tokenLabel, objectLabel, pinFilePath string) ([]byte, error) {
 	slotID, err := c.FindSlotByTokenLabel(tokenLabel)
 	if err != nil {
 		return nil, err
@@ -430,20 +439,108 @@ func (c *Client) FetchRawPublicKey(tokenLabel, objectLabel string) ([]byte, erro
 
 	session, err := c.ctx.OpenSession(slotID, pkcs11.CKF_SERIAL_SESSION)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open public session on slot %d: %w", slotID, err)
+		return nil, fmt.Errorf("failed to open session on slot %d: %w", slotID, err)
 	}
 	defer c.ctx.CloseSession(session)
+
+	if pinFilePath != "" {
+		pin, err := ReadPINFile(pinFilePath)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.ctx.Login(session, pkcs11.CKU_USER, pin); err != nil {
+			return nil, fmt.Errorf("failed to login to token: %w", err)
+		}
+		defer c.ctx.Logout(session)
+	}
 
 	pubHandle, err := c.findUniqueMLKEMKey(session, pkcs11.CKO_PUBLIC_KEY, objectLabel, tokenLabel)
 	if err != nil {
 		return nil, err
 	}
 
-	return c.readValue(session, pubHandle, "public key")
+	rawKey, err := c.readValue(session, pubHandle, "public key")
+	if err != nil {
+		return nil, err
+	}
+
+	if pinFilePath == "" {
+		fmt.Println("[!] Warning: no HSM_PIN_FILE set; public/private key pairing not verified")
+		return rawKey, nil
+	}
+	if err := c.verifyKeyPair(session, pubHandle, rawKey, objectLabel, tokenLabel); err != nil {
+		return nil, err
+	}
+	return rawKey, nil
 }
 
-func (c *Client) ExportPublicKeyPEM(tokenLabel, objectLabel, outputPath string) error {
-	rawPubKey, err := c.FetchRawPublicKey(tokenLabel, objectLabel)
+// verifyKeyPair checks, in a logged-in session, that the public key belongs to the
+// unique private key of the same label:
+//
+//  1. both carry the same non-empty CKA_ID (set at keygen; catches stale or
+//     mismatched objects, but CKA_ID is public and can be copied);
+//  2. a fresh local encapsulation to rawKey decapsulates on the HSM to the same
+//     shared secret, which only the matching private key can do.
+//
+// ML-KEM-512 cannot be encapsulated locally, so only step 1 runs for it.
+func (c *Client) verifyKeyPair(session pkcs11.SessionHandle, pubHandle pkcs11.ObjectHandle, rawKey []byte, objectLabel, tokenLabel string) error {
+	privHandle, err := c.findUniqueMLKEMKey(session, pkcs11.CKO_PRIVATE_KEY, objectLabel, tokenLabel)
+	if err != nil {
+		return err
+	}
+
+	pubID, err := c.readID(session, pubHandle, "public key")
+	if err != nil {
+		return err
+	}
+	privID, err := c.readID(session, privHandle, "private key")
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(pubID, privID) {
+		return fmt.Errorf("key pair mismatch: public key CKA_ID %x differs from private key CKA_ID %x", pubID, privID)
+	}
+
+	if len(rawKey) == 800 {
+		fmt.Printf("[!] Warning: ML-KEM-512 cannot be encapsulated locally; pairing checked by CKA_ID (%x) only\n", pubID)
+		return nil
+	}
+
+	ciphertext, want, _, err := EncapsulateFromRawKey(rawKey)
+	if err != nil {
+		return fmt.Errorf("pairing check encapsulation failed: %w", err)
+	}
+	defer clear(want)
+
+	got, err := c.decapsulateWith(session, privHandle, ciphertext)
+	if err != nil {
+		return fmt.Errorf("pairing check decapsulation failed: %w", err)
+	}
+	defer clear(got)
+
+	if subtle.ConstantTimeCompare(got, want) != 1 {
+		return errors.New("key pair mismatch: the HSM private key does not decapsulate to the public key's shared secret")
+	}
+	fmt.Printf("[+] Key pair verified: CKA_ID %x, encapsulation round-trip on HSM succeeded\n", pubID)
+	return nil
+}
+
+// readID reads a non-empty CKA_ID.
+func (c *Client) readID(session pkcs11.SessionHandle, obj pkcs11.ObjectHandle, what string) ([]byte, error) {
+	attrs, err := c.ctx.GetAttributeValue(session, obj, []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_ID, nil),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %s CKA_ID: %w", what, err)
+	}
+	if len(attrs) == 0 || len(attrs[0].Value) == 0 {
+		return nil, fmt.Errorf("%s has no CKA_ID (generated before key pairing was recorded? re-run -g)", what)
+	}
+	return attrs[0].Value, nil
+}
+
+func (c *Client) ExportPublicKeyPEM(tokenLabel, objectLabel, pinFilePath, outputPath string) error {
+	rawPubKey, err := c.FetchRawPublicKey(tokenLabel, objectLabel, pinFilePath)
 	if err != nil {
 		return err
 	}
@@ -513,20 +610,26 @@ func (c *Client) Decapsulate(tokenLabel, objectLabel, pinFilePath string, cipher
 	privUniqueID := c.GetUniqueID(session, privHandle)
 	fmt.Printf("[*] Located private key object handle: %d (0x%X, CKA_UNIQUE_ID: %s)\n", privHandle, privHandle, privUniqueID)
 
-	derivedKeyHandle, err := c.v3.DecapsulateKey(uint(session), CKM_ML_KEM, uint(privHandle), ciphertext)
-	if err != nil {
-		return nil, fmt.Errorf("HSM C_DecapsulateKey failed: %w", err)
-	}
-	defer c.ctx.DestroyObject(session, pkcs11.ObjectHandle(derivedKeyHandle))
-
 	// The caller owns the returned secret and should clear() it after use.
-	sharedSecret, err := c.readValue(session, pkcs11.ObjectHandle(derivedKeyHandle), "derived shared secret")
+	sharedSecret, err := c.decapsulateWith(session, privHandle, ciphertext)
 	if err != nil {
 		return nil, err
 	}
 
 	fmt.Printf("[+] HSM Decapsulation completed natively on server!\n")
 	return sharedSecret, nil
+}
+
+// decapsulateWith runs C_DecapsulateKey with privHandle in a logged-in session and
+// returns the shared secret, destroying the temporary derived key object.
+func (c *Client) decapsulateWith(session pkcs11.SessionHandle, privHandle pkcs11.ObjectHandle, ciphertext []byte) ([]byte, error) {
+	derivedKeyHandle, err := c.v3.DecapsulateKey(uint(session), CKM_ML_KEM, uint(privHandle), ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("HSM C_DecapsulateKey failed: %w", err)
+	}
+	defer c.ctx.DestroyObject(session, pkcs11.ObjectHandle(derivedKeyHandle))
+
+	return c.readValue(session, pkcs11.ObjectHandle(derivedKeyHandle), "derived shared secret")
 }
 
 func EncapsulateFromRawKey(rawKey []byte) (ciphertext []byte, sharedSecret []byte, algName string, err error) {

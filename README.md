@@ -186,6 +186,8 @@ make extract-pk
 # [*] Fingerprint  : SHA256:e88dec6e...532a1f91
 ```
 
+When `HSM_PIN_FILE` is set (the Makefile always sets it), `-p` and `-e` log in and prove that the public key belongs to the private key with the same label before using it. They check that both halves carry the same `CKA_ID`, then encapsulate locally to the public key and decapsulate on the HSM, and require the two shared secrets to match. The public object can be replaced without the PIN, and `CKA_ID` can be copied, so only the round trip proves the pairing. Without a PIN file, the pairing isn't checked and a warning is printed.
+
 The PEM file carries no proof of origin: anyone who can replace it in transit can make the sender encrypt to their own key. Hand the fingerprint to the sender over a channel you trust, so they can pin it in Step 4.
 
 #### Equivalent OpenSSL Command:

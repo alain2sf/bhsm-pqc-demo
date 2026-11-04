@@ -472,3 +472,37 @@ func TestReadPINFile(t *testing.T) {
 		t.Errorf("expected empty PIN file to be rejected")
 	}
 }
+
+// TestLiveKeyPairVerification fetches the demo public key with the PIN, which
+// proves on the HSM that it pairs with the private key of the same label.
+func TestLiveKeyPairVerification(t *testing.T) {
+	libPath := os.Getenv("PKCS11_LIB_PATH")
+	token, label, pinFile := os.Getenv("HSM_TOKEN_LABEL"), os.Getenv("HSM_OBJECT_LABEL"), os.Getenv("HSM_PIN_FILE")
+	if libPath == "" || os.Getenv("BOUNCY_HSM_CFG_STRING") == "" || token == "" || label == "" || pinFile == "" {
+		t.Skip("PKCS11_LIB_PATH, BOUNCY_HSM_CFG_STRING, HSM_TOKEN_LABEL, HSM_OBJECT_LABEL and HSM_PIN_FILE are required; skipping")
+	}
+	if _, err := os.Stat(libPath); err != nil {
+		t.Skipf("library not available (%v); skipping", err)
+	}
+	if _, err := os.Stat(pinFile); err != nil {
+		t.Skipf("PIN file not available (%v); skipping", err)
+	}
+
+	client, err := hsm.NewClient(libPath)
+	if err != nil {
+		t.Skipf("could not connect to live HSM (%v); skipping", err)
+	}
+	defer client.Close()
+
+	if _, err := client.FindSlotByTokenLabel(token); err != nil {
+		t.Skipf("token %q not present (%v); skipping", token, err)
+	}
+
+	raw, err := client.FetchRawPublicKey(token, label, pinFile)
+	if err != nil {
+		t.Fatalf("FetchRawPublicKey with pairing check failed: %v", err)
+	}
+	if n := len(raw); n != 800 && n != 1184 && n != 1568 {
+		t.Fatalf("unexpected key length %d", n)
+	}
+}
