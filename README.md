@@ -179,7 +179,7 @@ openssl genpkey -provider pkcs11prov -provider default -algorithm ML-KEM-768 \
 ---
 
 ### Step 3: Extract Public Key to PEM (`make extract-pk`)
-Opens a public (unauthenticated i.e. no PIN required) session to the HSM, locates the public key object, extracts the raw 1184-byte key material, formats it into an ASN.1 `SubjectPublicKeyInfo` container (using NIST OID `2.16.840.1.101.3.4.4.2`), and saves it to a standard PEM file. It also prints the key's **SHA-256 fingerprint** (the SHA-256 of the DER `SubjectPublicKeyInfo`), and recomputes it with OpenSSL as a cross-check:
+Opens a session to the HSM (logged in when `HSM_PIN_FILE` is set, for the pairing check below), locates the unique ML-KEM public key object with the label (several matches are refused), extracts the raw 1184-byte key material, formats it into an ASN.1 `SubjectPublicKeyInfo` container (using NIST OID `2.16.840.1.101.3.4.4.2`), and saves it to a standard PEM file. It also prints the key's **SHA-256 fingerprint** (the SHA-256 of the DER `SubjectPublicKeyInfo`), and recomputes it with OpenSSL as a cross-check:
 
 ```bash
 make extract-pk
@@ -219,6 +219,8 @@ Without a pinned fingerprint, `-e -in` prints the key's fingerprint and a warnin
 openssl pkey -pubin -in mlkem768_pub.pem -outform DER | openssl dgst -sha256
 ```
 
+A PEM file must be a well-formed ML-KEM `SubjectPublicKeyInfo`: the OID must match the key length, there must be no algorithm parameters and no trailing data, and the BIT STRING must be a whole number of bytes. Otherwise it is rejected. The shared secret is written with mode `0600`. The CLI refuses to overwrite an existing secret file, so the Makefile targets delete old outputs first.
+
 #### Equivalent OpenSSL Command:
 ```bash
 openssl pkeyutl -encap \
@@ -230,7 +232,7 @@ openssl pkeyutl -encap \
 ---
 
 ### Step 5: Decapsulate Shared Secret on HSM (`make decap`)
-Authenticates to the HSM token using the PIN file, locates the private key object handle, and executes native decapsulation on the HSM server using the PKCS#11 v3.2 function **`C_DecapsulateKey`** via `internal/pkcs11v3`, recovering `receiver_secret.bin` (32 bytes):
+Authenticates to the HSM token using the PIN file, locates the private key object handle, and executes native decapsulation on the HSM server using the PKCS#11 v3.2 function **`C_DecapsulateKey`** via `internal/pkcs11v3`, recovering `receiver_secret.bin` (32 bytes, mode `0600`, never overwritten). Exactly one ML-KEM private key must carry the label. A ciphertext whose length matches no ML-KEM parameter set (768, 1088 or 1568 bytes) is rejected before it reaches the HSM:
 
 ```bash
 make decap
@@ -254,10 +256,12 @@ make verify
 make show-secrets
 ```
 
+`show-secrets` prints the raw shared secrets behind a warning banner. It is for local inspection only, is not part of `make demo`, and must never run in CI or anywhere its output is logged.
+
 ---
 
 ### Step 7: Encrypt Payload with Derived AES-256-GCM Key (`make sym-enc`)
-Derives the 32-byte AES key from `sender_secret.bin` using HKDF-SHA256 and encrypts `msg.txt` into `msg.enc`, binding the payload to `ciphertext.bin` through the AAD:
+Derives the 32-byte AES key from `sender_secret.bin` using HKDF-SHA256 and encrypts `msg.txt` into `msg.enc`, binding the payload to `ciphertext.bin` through the AAD. The Makefile creates the sample `msg.txt` with owner-only permissions. Neither the AES key nor the plaintext is printed:
 ```bash
 make sym-enc
 ```
@@ -265,7 +269,7 @@ make sym-enc
 ---
 
 ### Step 8: Decrypt Payload with Recovered AES-256-GCM Key (`make sym-dec`)
-Derives the 32-byte AES key from `receiver_secret.bin` using HKDF-SHA256, verifies the GCM authentication tag (which also covers the header and `ciphertext.bin`), and decrypts `msg.enc` into `msg.dec`:
+Derives the 32-byte AES key from `receiver_secret.bin` using HKDF-SHA256, verifies the GCM authentication tag (which also covers the header and `ciphertext.bin`), and decrypts `msg.enc` into `msg.dec` (mode `0600`, never overwritten):
 ```bash
 make sym-dec
 ```
@@ -290,11 +294,13 @@ make demo
 
 Run unit tests across all subpackages (`cmd`, `internal/hsm`, `internal/pkcs11v3`, and `internal/sym`).
 
-Unit tests validate CLI flags, algorithm parsing, error branches, ASN.1 / X.509 `SubjectPublicKeyInfo` encoding, encapsulation round-trips, and the isolated PKCS#11 v3.2 driver:
+Unit tests validate CLI flags, algorithm parsing, error branches, ASN.1 / X.509 `SubjectPublicKeyInfo` encoding, encapsulation round-trips, fingerprint pinning, AES-GCM format and KEM-ciphertext binding, secret file permissions, and the isolated PKCS#11 v3.2 driver:
 
 ```bash
 make test
 ```
+
+Tests that need the HSM skip themselves when it isn't configured or can't be reached, so a plain `go test ./...` passes offline. `make test` exports `PKCS11_LIB_PATH` and `BOUNCY_HSM_CFG_STRING`, plus `HSM_TOKEN_LABEL`, `HSM_OBJECT_LABEL` and `HSM_PIN_FILE` (made absolute). With these, `TestLiveKeyPairVerification` logs in and checks the demo key pair on the live HSM. It is read-only: the temporary decapsulated key is destroyed.
 
 ---
 
