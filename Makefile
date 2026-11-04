@@ -3,7 +3,8 @@ BINARY_NAME=bhsm-pqc-demo
 BUILD_DIR=bin
 CMD_PATH=./cmd/bhsm-pqc-demo
 
-REQUIRED_GO_VERSION=go1.27.1
+# Minimum Go toolchain (any newer release is accepted)
+MIN_GO_VERSION=go1.27.1
 
 export GO111MODULE=on
 export GOTOOLCHAIN=auto
@@ -56,13 +57,21 @@ all: build
 # Build and Dependency Targets
 # ----------------------------------------------------------------------------
 
+# Numeric major.minor.patch comparison: passes when the installed Go >= MIN_GO_VERSION.
+# ("go1.28rc1" compares as 1.28.0 because awk reads the leading digits of "28rc1".)
 check-go-version:
-	@GO_VER=$$(go version | awk '{print $$3}'); \
-	if [ "$$GO_VER" != "$(REQUIRED_GO_VERSION)" ]; then \
-		echo "[-] Error: Go version mismatch. Required: $(REQUIRED_GO_VERSION), Found: $$GO_VER"; \
-		exit 1; \
+	@GO_VER=$$(go env GOVERSION); \
+	if awk -v have="$${GO_VER#go}" -v want="$(MIN_GO_VERSION:go%=%)" 'BEGIN { \
+			split(have, h, "."); split(want, w, "."); \
+			for (i = 1; i <= 3; i++) { \
+				if (h[i] + 0 > w[i] + 0) exit 0; \
+				if (h[i] + 0 < w[i] + 0) exit 1; \
+			} \
+			exit 0 }'; then \
+		echo "[✓] Go version requirement met: $$GO_VER (minimum $(MIN_GO_VERSION))"; \
 	else \
-		echo "[✓] Go version requirement met: $$GO_VER"; \
+		echo "[-] Error: Go version too old. Minimum: $(MIN_GO_VERSION), Found: $$GO_VER"; \
+		exit 1; \
 	fi
 
 deps: check-go-version

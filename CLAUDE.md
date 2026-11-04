@@ -9,7 +9,7 @@ ML-KEM keygen on the HSM → public key export to PEM → local encapsulation �
 
 ## Commands
 
-The Makefile pins the Go toolchain: `check-go-version` fails unless `go version` reports exactly `go1.27.1`. `deps`, `build` and `test` all depend on it. `build` runs `go mod tidy` and `go vet ./...` before compiling to `bin/bhsm-pqc-demo`.
+The Makefile sets a minimum Go version: `check-go-version` fails if the installed Go is older than `MIN_GO_VERSION` (`go1.27.1`, the same as `go.mod`). `deps`, `build` and `test` all depend on it. `build` runs `go mod tidy` and `go vet ./...` before compiling to `bin/bhsm-pqc-demo`.
 
 ```bash
 make build                     # tidy + vet + build bin/bhsm-pqc-demo
