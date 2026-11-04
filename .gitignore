@@ -5,7 +5,7 @@
 # -----------------------------------------------------------------------------
 # Project binary
 # Add your compiled binary name here after scaffolding, e.g.:
-bhsm-pqc-demo
+/bhsm-pqc-demo
 # Or redirect 'go build' output to bin/ (already ignored below).
 # -----------------------------------------------------------------------------
 
