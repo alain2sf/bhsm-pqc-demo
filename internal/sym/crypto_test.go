@@ -79,3 +79,13 @@ func TestAESGCM_RoundTrip(t *testing.T) {
 		t.Errorf("Expected decryption error on tampered ciphertext, got nil")
 	}
 }
+
+// TestDeriveAES256Key_RejectsWrongSecretLength ensures only 32-byte ML-KEM
+// shared secrets are accepted as HKDF input.
+func TestDeriveAES256Key_RejectsWrongSecretLength(t *testing.T) {
+	for _, n := range []int{0, 1, 31, 33, 64} {
+		if _, err := sym.DeriveAES256Key(make([]byte, n), nil, nil); err == nil {
+			t.Errorf("expected error for %d-byte secret, got nil", n)
+		}
+	}
+}

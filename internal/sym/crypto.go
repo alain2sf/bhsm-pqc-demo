@@ -19,10 +19,15 @@ const (
 	DefaultInfo = "bhsm-demo aes-256-gcm v1"
 )
 
+// SharedSecretSize is the ML-KEM (FIPS 203) shared secret length for all parameter sets.
+const SharedSecretSize = 32
+
 // DeriveAES256Key derives a 32-byte (256-bit) AES key from a KEM shared secret using HKDF-SHA256.
+// The secret must be exactly SharedSecretSize bytes, which guards against deriving a key
+// from the wrong file (e.g. a plaintext passed as -secret).
 func DeriveAES256Key(secret []byte, salt []byte, info []byte) ([]byte, error) {
-	if len(secret) == 0 {
-		return nil, fmt.Errorf("input secret material cannot be empty")
+	if len(secret) != SharedSecretSize {
+		return nil, fmt.Errorf("shared secret must be %d bytes, got %d", SharedSecretSize, len(secret))
 	}
 
 	if len(salt) == 0 {

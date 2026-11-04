@@ -35,7 +35,7 @@ Tests are split into offline and live ones. Live tests (`TestLiveClientMethods`,
 
 ## Architecture
 
-- **`cmd/bhsm-pqc-demo/main.go`**: a single flag-driven CLI with mutually exclusive actions (`-c`, `-g <alg>`, `-p`, `-e`, `-d`, `-sym-enc`, `-sym-dec`). Token, object and PIN settings come **only from environment variables** (`HSM_TOKEN_LABEL`, `HSM_OBJECT_LABEL`, `HSM_PIN_FILE`). File paths come from flags, then env fallbacks (`HSM_CIPHER_FILE`, `HSM_SECRET_FILE`, `HSM_PUBKEY_FILE`, `PLAIN_MSG_FILE`, ...), then `./` defaults. The library path is resolved from `-lib`, then `PKCS11_LIB_PATH`, then `./libBouncyHsm.Pkcs11Lib.dylib`. The Bouncy HSM dylib itself reads `BOUNCY_HSM_CFG_STRING` to find the server.
+- **`cmd/bhsm-pqc-demo/main.go`**: a single flag-driven CLI with mutually exclusive actions (`-c`, `-g <alg>`, `-p`, `-e`, `-d`, `-sym-enc`, `-sym-dec`). Token, object and PIN settings come **only from environment variables** (`HSM_TOKEN_LABEL`, `HSM_OBJECT_LABEL`, `HSM_PIN_FILE`). File paths come from flags, then env fallbacks (`HSM_CIPHER_FILE`, `HSM_SECRET_FILE`, `HSM_PUBKEY_FILE`, `PLAIN_MSG_FILE`, ...), then `./` defaults. The library path is resolved from `-lib`, then `PKCS11_LIB_PATH`. It must be absolute, and there is deliberately no CWD fallback, because a relative path would allow library planting. Shared secrets and decrypted plaintext are written through `writeSecretFile` (`0600`, `O_EXCL`), so each output path must not already exist; the Makefile runs `rm -f` first for this reason. The Bouncy HSM dylib itself reads `BOUNCY_HSM_CFG_STRING` to find the server.
 - **`internal/hsm`**: high-level PKCS#11 operations built on `github.com/miekg/pkcs11` (v2.40 API). `hsm.Client` holds **two handles to the same dylib**:
   - a `miekg/pkcs11` context for standard calls
   - a `pkcs11v3.Driver` (raw `dlopen`) for v3.2 functions that miekg lacks
@@ -44,7 +44,7 @@ Tests are split into offline and live ones. Live tests (`TestLiveClientMethods`,
 - **`internal/pkcs11v3`**: an isolated cgo bridge. It `dlsym`s `C_DecapsulateKey` and calls it with the derived-key template built entirely in C memory: a session-only, extractable, non-sensitive `CKK_GENERIC_SECRET` with 32-byte `CKA_VALUE_LEN`. This avoids passing Go pointers to C. The caller (`Client.Decapsulate`) reads `CKA_VALUE` off the returned handle and then destroys it. New v3.2 functions belong here.
 - **`internal/sym`**: HKDF-SHA256 via the stdlib `crypto/hkdf` with defaults salt `bhsm-demo-hkdf-salt-v1` and info `bhsm-demo aes-256-gcm v1`. Empty `-salt`/`-info` fall back to these. AES-256-GCM output is `nonce(12) || ciphertext || tag(16)`. It is not CMS `AuthEnvelopedData`, so it does not interoperate with `openssl cms`. `README-AES-256-GCM-Analysis.md` records this design decision and the older `cms-aes-256-gcm` info string from the original bash script.
 
-Behavior to know about: `-g` **deletes all existing public, private and secret key objects with the same label** before it generates a new pair.
+Behavior to know about: `-g` generates the new pair first, then **deletes every other public, private and secret key object with the same label**. Key lookups (`findUniqueMLKEMKey`) filter on `CKK_ML_KEM` and refuse a label with more than one match, so a leftover or planted duplicate makes encap and decap fail rather than pick the wrong key.
 
 ## Repo notes
 

@@ -1,16 +1,31 @@
 package main
 
 import (
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/alain2sf/bhsm-pqc-demo/internal/hsm"
 	"github.com/alain2sf/bhsm-pqc-demo/internal/sym"
 )
+
+// writeSecretFile writes key material or recovered plaintext with owner-only
+// permissions. O_EXCL refuses to overwrite an existing file (which would keep
+// its old, possibly world-readable mode) or to follow a pre-planted symlink.
+func writeSecretFile(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
 
 func requireEnv(key string) (string, error) {
 	val := strings.TrimSpace(os.Getenv(key))
@@ -65,7 +80,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  -salt <string>          HKDF salt\n")
 		fmt.Fprintf(os.Stderr, "  -info <string>          HKDF domain separation context\n")
 		fmt.Fprintf(os.Stderr, "  -o <path>               Output file path for public key (for -p)\n")
-		fmt.Fprintf(os.Stderr, "  -lib <path>             Path to PKCS#11 dynamic library\n")
+		fmt.Fprintf(os.Stderr, "  -lib <path>             Absolute path to PKCS#11 dynamic library (or PKCS11_LIB_PATH)\n")
 	}
 
 	flag.Parse()
@@ -109,8 +124,14 @@ func main() {
 	if libPath == "" {
 		libPath = os.Getenv("PKCS11_LIB_PATH")
 	}
-	if libPath == "" {
-		libPath = "./libBouncyHsm.Pkcs11Lib.dylib"
+	// No implicit fallback: a relative default would dlopen whatever library sits
+	// in the current directory, and that code would see the PIN at C_Login.
+	needsHSM := !*symEncFlag && !*symDecFlag && !(*encapFlag && (*inFile != "" || os.Getenv("HSM_PUBKEY_FILE") != ""))
+	if needsHSM && libPath == "" {
+		log.Fatalf("[-] PKCS#11 library path required: use -lib <absolute path> or set PKCS11_LIB_PATH")
+	}
+	if libPath != "" && !filepath.IsAbs(libPath) {
+		log.Fatalf("[-] PKCS#11 library path must be absolute, got %q", libPath)
 	}
 
 	// 3. Dispatch selected action
@@ -233,7 +254,7 @@ func main() {
 		if err := os.WriteFile(targetCipherFile, ciphertext, 0644); err != nil {
 			log.Fatalf("[-] Failed to write ciphertext: %v", err)
 		}
-		if err := os.WriteFile(targetSecretFile, sharedSecret, 0644); err != nil {
+		if err := writeSecretFile(targetSecretFile, sharedSecret); err != nil {
 			log.Fatalf("[-] Failed to write shared secret: %v", err)
 		}
 
@@ -283,7 +304,7 @@ func main() {
 			log.Fatalf("[-] Decapsulation failed: %v", err)
 		}
 
-		if err := os.WriteFile(targetSecretFile, sharedSecret, 0644); err != nil {
+		if err := writeSecretFile(targetSecretFile, sharedSecret); err != nil {
 			log.Fatalf("[-] Failed to write shared secret: %v", err)
 		}
 
@@ -324,7 +345,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("[-] Key derivation failed: %v", err)
 		}
-		fmt.Printf("[*] Derived AES-256 Key (HKDF): %s\n", hex.EncodeToString(aesKey))
+		fmt.Printf("[*] Derived AES-256 key via HKDF-SHA256 (%d bytes)\n", len(aesKey))
 
 		// 2. Encrypt with AES-256-GCM
 		encryptedBytes, err := sym.EncryptAESGCM(aesKey, plainBytes)
@@ -374,7 +395,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("[-] Key derivation failed: %v", err)
 		}
-		fmt.Printf("[*] Derived AES-256 Key (HKDF): %s\n", hex.EncodeToString(aesKey))
+		fmt.Printf("[*] Derived AES-256 key via HKDF-SHA256 (%d bytes)\n", len(aesKey))
 
 		// 2. Decrypt & Authenticate with AES-256-GCM
 		decryptedBytes, err := sym.DecryptAESGCM(aesKey, encBytes)
@@ -382,13 +403,12 @@ func main() {
 			log.Fatalf("[-] Decryption failed: %v", err)
 		}
 
-		if err := os.WriteFile(targetOutFile, decryptedBytes, 0644); err != nil {
+		if err := writeSecretFile(targetOutFile, decryptedBytes); err != nil {
 			log.Fatalf("[-] Failed to write decrypted output: %v", err)
 		}
 
 		fmt.Printf("[+] AES-256-GCM Decryption & Authentication successful!\n")
 		fmt.Printf("    Decrypted Payload: %s (%d bytes)\n", targetOutFile, len(decryptedBytes))
-		fmt.Printf("    Recovered Text   : %q\n", string(decryptedBytes))
 	}
 }
 

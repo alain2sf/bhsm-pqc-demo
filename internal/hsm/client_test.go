@@ -359,3 +359,17 @@ func TestLiveClientMethods(t *testing.T) {
 		t.Errorf("Expected error when searching for non-existent token, got nil")
 	}
 }
+
+// TestValidateMLKEMCiphertextLength accepts only FIPS 203 ciphertext sizes.
+func TestValidateMLKEMCiphertextLength(t *testing.T) {
+	for _, n := range []int{768, 1088, 1568} {
+		if err := hsm.ValidateMLKEMCiphertextLength(make([]byte, n)); err != nil {
+			t.Errorf("expected %d-byte ciphertext to be valid, got: %v", n, err)
+		}
+	}
+	for _, n := range []int{0, 1, 767, 1087, 1089, 2048} {
+		if err := hsm.ValidateMLKEMCiphertextLength(make([]byte, n)); err == nil {
+			t.Errorf("expected %d-byte ciphertext to be rejected, got nil", n)
+		}
+	}
+}

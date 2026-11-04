@@ -4,6 +4,7 @@ package hsm
 
 import (
 	"crypto/mlkem"
+	"crypto/rand"
 	"encoding/asn1"
 	"encoding/pem"
 	"fmt"
@@ -27,6 +28,13 @@ const (
 	CKP_ML_KEM_512  = 1
 	CKP_ML_KEM_768  = 2
 	CKP_ML_KEM_1024 = 3
+)
+
+// FIPS 203 ML-KEM ciphertext sizes in bytes.
+const (
+	MLKEM512CiphertextSize  = 768
+	MLKEM768CiphertextSize  = 1088
+	MLKEM1024CiphertextSize = 1568
 )
 
 // NIST FIPS 203 / IETF OIDs for ML-KEM
@@ -182,9 +190,62 @@ func (c *Client) GetUniqueID(session pkcs11.SessionHandle, obj pkcs11.ObjectHand
 	return strVal
 }
 
+// findObjects returns every object handle matching the template.
+func (c *Client) findObjects(session pkcs11.SessionHandle, template []*pkcs11.Attribute) ([]pkcs11.ObjectHandle, error) {
+	if err := c.ctx.FindObjectsInit(session, template); err != nil {
+		return nil, fmt.Errorf("C_FindObjectsInit failed: %w", err)
+	}
+
+	var all []pkcs11.ObjectHandle
+	for {
+		objs, _, err := c.ctx.FindObjects(session, 50)
+		if err != nil {
+			_ = c.ctx.FindObjectsFinal(session)
+			return nil, fmt.Errorf("C_FindObjects failed: %w", err)
+		}
+		if len(objs) == 0 {
+			break
+		}
+		all = append(all, objs...)
+	}
+
+	if err := c.ctx.FindObjectsFinal(session); err != nil {
+		return nil, fmt.Errorf("C_FindObjectsFinal failed: %w", err)
+	}
+	return all, nil
+}
+
+// findUniqueMLKEMKey locates exactly one ML-KEM key of the given class and label.
+// Zero matches or more than one match are errors: an ambiguous label could let a
+// planted object stand in for the real key.
+func (c *Client) findUniqueMLKEMKey(session pkcs11.SessionHandle, class uint, objectLabel, tokenLabel string) (pkcs11.ObjectHandle, error) {
+	kind := "public"
+	if class == pkcs11.CKO_PRIVATE_KEY {
+		kind = "private"
+	}
+
+	objs, err := c.findObjects(session, []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_CLASS, class),
+		pkcs11.NewAttribute(pkcs11.CKA_KEY_TYPE, CKK_ML_KEM),
+		pkcs11.NewAttribute(pkcs11.CKA_LABEL, objectLabel),
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	switch len(objs) {
+	case 0:
+		return 0, fmt.Errorf("ML-KEM %s key '%s' not found on token '%s'", kind, objectLabel, tokenLabel)
+	case 1:
+		return objs[0], nil
+	default:
+		return 0, fmt.Errorf("ambiguous: %d ML-KEM %s keys labelled '%s' on token '%s'", len(objs), kind, objectLabel, tokenLabel)
+	}
+}
+
 // DeleteObjectsByLabel searches for, logs CKA_UNIQUE_ID, and deletes all existing
-// objects matching the specified label on the active token.
-func (c *Client) DeleteObjectsByLabel(session pkcs11.SessionHandle, objectLabel string) error {
+// objects matching the specified label on the active token, except handles in keep.
+func (c *Client) DeleteObjectsByLabel(session pkcs11.SessionHandle, objectLabel string, keep map[pkcs11.ObjectHandle]bool) error {
 	classes := []struct {
 		id   uint
 		name string
@@ -197,40 +258,28 @@ func (c *Client) DeleteObjectsByLabel(session pkcs11.SessionHandle, objectLabel 
 	var deletedLog []string
 
 	for _, cls := range classes {
-		template := []*pkcs11.Attribute{
+		// Collect handles first, then destroy outside the active search.
+		objs, err := c.findObjects(session, []*pkcs11.Attribute{
 			pkcs11.NewAttribute(pkcs11.CKA_CLASS, cls.id),
 			pkcs11.NewAttribute(pkcs11.CKA_LABEL, objectLabel),
+		})
+		if err != nil {
+			return fmt.Errorf("%s search failed: %w", cls.name, err)
 		}
 
-		if err := c.ctx.FindObjectsInit(session, template); err != nil {
-			return fmt.Errorf("FindObjectsInit failed for %s: %w", cls.name, err)
-		}
-
-		for {
-			objs, _, err := c.ctx.FindObjects(session, 50)
-			if err != nil {
-				_ = c.ctx.FindObjectsFinal(session)
-				return fmt.Errorf("FindObjects failed for %s: %w", cls.name, err)
-			}
-			if len(objs) == 0 {
-				break
+		for _, obj := range objs {
+			if keep[obj] {
+				continue
 			}
 
-			for _, obj := range objs {
-				// Query CKA_UNIQUE_ID before destroying the object
-				uniqueID := c.GetUniqueID(session, obj)
+			// Query CKA_UNIQUE_ID before destroying the object
+			uniqueID := c.GetUniqueID(session, obj)
 
-				if err := c.ctx.DestroyObject(session, obj); err != nil {
-					_ = c.ctx.FindObjectsFinal(session)
-					return fmt.Errorf("failed to destroy %s (handle %d): %w", cls.name, obj, err)
-				}
-
-				deletedLog = append(deletedLog, fmt.Sprintf("    -> Deleted %-11s (Handle: %d, CKA_UNIQUE_ID: %s)", cls.name, obj, uniqueID))
+			if err := c.ctx.DestroyObject(session, obj); err != nil {
+				return fmt.Errorf("failed to destroy %s (handle %d): %w", cls.name, obj, err)
 			}
-		}
 
-		if err := c.ctx.FindObjectsFinal(session); err != nil {
-			return fmt.Errorf("FindObjectsFinal failed for %s: %w", cls.name, err)
+			deletedLog = append(deletedLog, fmt.Sprintf("    -> Deleted %-11s (Handle: %d, CKA_UNIQUE_ID: %s)", cls.name, obj, uniqueID))
 		}
 	}
 
@@ -275,12 +324,13 @@ func (c *Client) GenerateMLKEMKeyPair(tokenLabel, objectLabel, pinFilePath, algo
 	}
 	defer c.ctx.Logout(session)
 
-	// Clean up any existing keys matching the label before generating new ones
-	if err := c.DeleteObjectsByLabel(session, objectLabel); err != nil {
-		return fmt.Errorf("pre-generation cleanup failed: %w", err)
-	}
-
 	fmt.Printf("[*] Generating %s key pair (Object Label: '%s')...\n", algorithm, objectLabel)
+
+	// Random CKA_ID shared by both halves so the pair can be matched unambiguously.
+	keyID := make([]byte, 16)
+	if _, err := rand.Read(keyID); err != nil {
+		return fmt.Errorf("failed to generate CKA_ID: %w", err)
+	}
 
 	mech := []*pkcs11.Mechanism{
 		pkcs11.NewMechanism(CKM_ML_KEM_KEY_PAIR_GEN, nil),
@@ -290,6 +340,7 @@ func (c *Client) GenerateMLKEMKeyPair(tokenLabel, objectLabel, pinFilePath, algo
 		pkcs11.NewAttribute(pkcs11.CKA_TOKEN, true),
 		pkcs11.NewAttribute(pkcs11.CKA_PRIVATE, false),
 		pkcs11.NewAttribute(pkcs11.CKA_LABEL, objectLabel),
+		pkcs11.NewAttribute(pkcs11.CKA_ID, keyID),
 		pkcs11.NewAttribute(CKA_PARAMETER_SET, paramSet),
 		pkcs11.NewAttribute(CKA_ENCAPSULATE, true),
 	}
@@ -298,14 +349,24 @@ func (c *Client) GenerateMLKEMKeyPair(tokenLabel, objectLabel, pinFilePath, algo
 		pkcs11.NewAttribute(pkcs11.CKA_TOKEN, true),
 		pkcs11.NewAttribute(pkcs11.CKA_PRIVATE, true),
 		pkcs11.NewAttribute(pkcs11.CKA_SENSITIVE, true),
+		pkcs11.NewAttribute(pkcs11.CKA_EXTRACTABLE, false),
 		pkcs11.NewAttribute(pkcs11.CKA_LABEL, objectLabel),
+		pkcs11.NewAttribute(pkcs11.CKA_ID, keyID),
 		pkcs11.NewAttribute(CKA_PARAMETER_SET, paramSet),
 		pkcs11.NewAttribute(CKA_DECAPSULATE, true),
 	}
 
+	// Generate first, so a failure here leaves any existing key pair intact.
 	pubHandle, privHandle, err := c.ctx.GenerateKeyPair(session, mech, pubTemplate, privTemplate)
 	if err != nil {
-		return fmt.Errorf("C_GenerateKeyPair failed: %w", err)
+		return fmt.Errorf("C_GenerateKeyPair failed (existing keys left untouched): %w", err)
+	}
+
+	// Now remove the previous objects with this label, keeping the new pair.
+	keep := map[pkcs11.ObjectHandle]bool{pubHandle: true, privHandle: true}
+	if err := c.DeleteObjectsByLabel(session, objectLabel, keep); err != nil {
+		return fmt.Errorf("new key pair created (pub %d, priv %d) but cleanup of old '%s' objects failed; "+
+			"lookups will refuse the label as ambiguous until it is resolved: %w", pubHandle, privHandle, objectLabel, err)
 	}
 
 	// Query CKA_UNIQUE_ID for both generated keys
@@ -332,30 +393,15 @@ func (c *Client) FetchRawPublicKey(tokenLabel, objectLabel string) ([]byte, erro
 	}
 	defer c.ctx.CloseSession(session)
 
-	template := []*pkcs11.Attribute{
-		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PUBLIC_KEY),
-		pkcs11.NewAttribute(pkcs11.CKA_LABEL, objectLabel),
-	}
-
-	if err := c.ctx.FindObjectsInit(session, template); err != nil {
-		return nil, fmt.Errorf("C_FindObjectsInit failed: %w", err)
-	}
-
-	objs, _, err := c.ctx.FindObjects(session, 1)
+	pubHandle, err := c.findUniqueMLKEMKey(session, pkcs11.CKO_PUBLIC_KEY, objectLabel, tokenLabel)
 	if err != nil {
-		_ = c.ctx.FindObjectsFinal(session)
-		return nil, fmt.Errorf("C_FindObjects failed: %w", err)
-	}
-	_ = c.ctx.FindObjectsFinal(session)
-
-	if len(objs) == 0 {
-		return nil, fmt.Errorf("public key '%s' not found on token '%s'", objectLabel, tokenLabel)
+		return nil, err
 	}
 
 	attrTemplate := []*pkcs11.Attribute{
 		pkcs11.NewAttribute(pkcs11.CKA_VALUE, nil),
 	}
-	attrs, err := c.ctx.GetAttributeValue(session, objs[0], attrTemplate)
+	attrs, err := c.ctx.GetAttributeValue(session, pubHandle, attrTemplate)
 	if err != nil || len(attrs) == 0 || len(attrs[0].Value) == 0 {
 		return nil, fmt.Errorf("failed to read public key CKA_VALUE: %w", err)
 	}
@@ -383,7 +429,23 @@ func (c *Client) ExportPublicKeyPEM(tokenLabel, objectLabel, outputPath string) 
 	return nil
 }
 
+// ValidateMLKEMCiphertextLength rejects ciphertexts whose length matches no
+// ML-KEM parameter set (FIPS 203: 768, 1088, or 1568 bytes).
+func ValidateMLKEMCiphertextLength(ciphertext []byte) error {
+	switch len(ciphertext) {
+	case MLKEM512CiphertextSize, MLKEM768CiphertextSize, MLKEM1024CiphertextSize:
+		return nil
+	default:
+		return fmt.Errorf("invalid ML-KEM ciphertext length: %d bytes (expected %d, %d, or %d)",
+			len(ciphertext), MLKEM512CiphertextSize, MLKEM768CiphertextSize, MLKEM1024CiphertextSize)
+	}
+}
+
 func (c *Client) Decapsulate(tokenLabel, objectLabel, pinFilePath string, ciphertext []byte) ([]byte, error) {
+	if err := ValidateMLKEMCiphertextLength(ciphertext); err != nil {
+		return nil, err
+	}
+
 	pinBytes, err := os.ReadFile(pinFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("could not read PIN file '%s': %w", pinFilePath, err)
@@ -407,26 +469,10 @@ func (c *Client) Decapsulate(tokenLabel, objectLabel, pinFilePath string, cipher
 	}
 	defer c.ctx.Logout(session)
 
-	template := []*pkcs11.Attribute{
-		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PRIVATE_KEY),
-		pkcs11.NewAttribute(pkcs11.CKA_LABEL, objectLabel),
-	}
-
-	if err := c.ctx.FindObjectsInit(session, template); err != nil {
-		return nil, fmt.Errorf("C_FindObjectsInit failed: %w", err)
-	}
-
-	objs, _, err := c.ctx.FindObjects(session, 1)
+	privHandle, err := c.findUniqueMLKEMKey(session, pkcs11.CKO_PRIVATE_KEY, objectLabel, tokenLabel)
 	if err != nil {
-		_ = c.ctx.FindObjectsFinal(session)
-		return nil, fmt.Errorf("C_FindObjects failed: %w", err)
+		return nil, err
 	}
-	_ = c.ctx.FindObjectsFinal(session)
-
-	if len(objs) == 0 {
-		return nil, fmt.Errorf("private key '%s' not found on token '%s'", objectLabel, tokenLabel)
-	}
-	privHandle := objs[0]
 	privUniqueID := c.GetUniqueID(session, privHandle)
 	fmt.Printf("[*] Located private key object handle: %d (0x%X, CKA_UNIQUE_ID: %s)\n", privHandle, privHandle, privUniqueID)
 
