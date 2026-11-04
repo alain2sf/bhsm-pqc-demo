@@ -28,10 +28,13 @@ Key PKCS#11 concepts used in this project:
 ### Hybrid Cryptography: Key Derivation (HKDF) & AES-256-GCM AEAD
 Once the 32-byte shared secret is established between sender and receiver via ML-KEM:
 1. **HKDF-SHA256 (RFC 5869):** Derives a cryptographically strong 32-byte (256-bit) AES key using a domain-separation salt (`bhsm-demo-hkdf-salt-v1`) and context info (`bhsm-demo aes-256-gcm v1`).
-2. **AES-256-GCM AEAD (NIST SP 800-38D):** Authenticated encryption mode that produces:
+2. **AES-256-GCM AEAD (NIST SP 800-38D):** Authenticated encryption mode. The encrypted file (format v1) is laid out as:
+   * **5-byte header** `BHSM` + version byte `0x01`
    * **12-byte random Nonce (IV)**
    * **Ciphertext**
    * **16-byte Authentication Tag (GHASH)** preventing any tampering or bit-flipping attacks.
+
+   The GCM additional authenticated data (AAD) is `header || SHA-256(KEM ciphertext)`. The header can't be altered, and a payload decrypts only together with the ML-KEM ciphertext (`ciphertext.bin`) whose shared secret produced its key.
 
 ---
 
@@ -112,7 +115,9 @@ See “BouncyHSM & OpenSSL Runbook (Demo Prototype) v1.0” [`BouncyHSM-OpenSSL-
 4. **PIN File**: Create a plain text file containing your HSM token User PIN:
    ```bash
    echo -n "123456" > ./DemoSlotToken1.pin
+   chmod 600 ./DemoSlotToken1.pin
    ```
+   The tool refuses a PIN file that group or others can read or write.
 
 ---
 
@@ -157,7 +162,7 @@ make conn
 ---
 
 ### Step 2: Generate ML-KEM-768 Key Pair on HSM (`make keygen`)
-Authenticates to the HSM token using the provided PIN file. Removes any existing keys matching `mlkem768-demo` (logging their `CKA_UNIQUE_ID`), generates a new persistent key pair, and logs the new `CKA_UNIQUE_ID` values:
+Authenticates to the HSM token using the provided PIN file, generates a new persistent key pair (private key non-extractable, both halves sharing a random `CKA_ID`), then removes the previous keys labelled `mlkem768-demo` (logging their `CKA_UNIQUE_ID`) and logs the new `CKA_UNIQUE_ID` values. Because generation happens first, a failed generation leaves the existing key pair intact:
 
 ```bash
 make keygen
@@ -237,7 +242,7 @@ make show-secrets
 ---
 
 ### Step 7: Encrypt Payload with Derived AES-256-GCM Key (`make sym-enc`)
-Derives the 32-byte AES key from `sender_secret.bin` using HKDF-SHA256 and encrypts `msg.txt` into `msg.enc`:
+Derives the 32-byte AES key from `sender_secret.bin` using HKDF-SHA256 and encrypts `msg.txt` into `msg.enc`, binding the payload to `ciphertext.bin` through the AAD:
 ```bash
 make sym-enc
 ```
@@ -245,7 +250,7 @@ make sym-enc
 ---
 
 ### Step 8: Decrypt Payload with Recovered AES-256-GCM Key (`make sym-dec`)
-Derives the 32-byte AES key from `receiver_secret.bin` using HKDF-SHA256, verifies the GCM authentication tag, and decrypts `msg.enc` into `msg.dec`:
+Derives the 32-byte AES key from `receiver_secret.bin` using HKDF-SHA256, verifies the GCM authentication tag (which also covers the header and `ciphertext.bin`), and decrypts `msg.enc` into `msg.dec`:
 ```bash
 make sym-dec
 ```
@@ -299,12 +304,12 @@ Actions (mutually exclusive - pick exactly one):
 Options:
   -in <path>              Input file path
   -out <path>             Output file path for symmetric payload
-  -cipher <path>          KEM ciphertext file path (default: ./ciphertext.bin)
+  -cipher <path>          KEM ciphertext file (-e output; -d/-sym-enc/-sym-dec input; default: ./ciphertext.bin)
   -secret <path>          Shared secret file path
   -salt <string>          HKDF salt
   -info <string>          HKDF domain separation context
   -o <path>               Output file path for public key (for -p)
-  -lib <path>             Path to PKCS#11 dynamic library
+  -lib <path>             Absolute path to PKCS#11 dynamic library (or PKCS11_LIB_PATH)
 
   Environment Variables:
   BOUNCY_HSM_CFG_STRING   HSM server configuration string

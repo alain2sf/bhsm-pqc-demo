@@ -295,17 +295,55 @@ func (c *Client) DeleteObjectsByLabel(session pkcs11.SessionHandle, objectLabel 
 	return nil
 }
 
+// ReadPINFile reads the token user PIN, refusing files that group or others can
+// access. The raw buffer is cleared after use; the returned string cannot be
+// (Go strings are immutable), so callers should keep it no longer than needed.
+func ReadPINFile(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("could not stat PIN file '%s': %w", path, err)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return "", fmt.Errorf("PIN file '%s' has permissions %04o; it must not be accessible by group or others (run: chmod 600 %s)", path, perm, path)
+	}
+
+	pinBytes, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("could not read PIN file '%s': %w", path, err)
+	}
+	defer clear(pinBytes)
+
+	pin := strings.TrimRight(string(pinBytes), "\r\n")
+	if pin == "" {
+		return "", fmt.Errorf("PIN file '%s' is empty", path)
+	}
+	return pin, nil
+}
+
+// readValue reads a non-empty CKA_VALUE, reporting PKCS#11 errors and empty values separately.
+func (c *Client) readValue(session pkcs11.SessionHandle, obj pkcs11.ObjectHandle, what string) ([]byte, error) {
+	attrs, err := c.ctx.GetAttributeValue(session, obj, []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_VALUE, nil),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %s CKA_VALUE: %w", what, err)
+	}
+	if len(attrs) == 0 || len(attrs[0].Value) == 0 {
+		return nil, fmt.Errorf("%s CKA_VALUE is empty", what)
+	}
+	return attrs[0].Value, nil
+}
+
 func (c *Client) GenerateMLKEMKeyPair(tokenLabel, objectLabel, pinFilePath, algorithm string) error {
 	paramSet, err := ParseMLKEMAlgorithm(algorithm)
 	if err != nil {
 		return err
 	}
 
-	pinBytes, err := os.ReadFile(pinFilePath)
+	pin, err := ReadPINFile(pinFilePath)
 	if err != nil {
-		return fmt.Errorf("could not read PIN file '%s': %w", pinFilePath, err)
+		return err
 	}
-	pin := strings.TrimRight(string(pinBytes), "\r\n")
 
 	slotID, err := c.FindSlotByTokenLabel(tokenLabel)
 	if err != nil {
@@ -398,15 +436,7 @@ func (c *Client) FetchRawPublicKey(tokenLabel, objectLabel string) ([]byte, erro
 		return nil, err
 	}
 
-	attrTemplate := []*pkcs11.Attribute{
-		pkcs11.NewAttribute(pkcs11.CKA_VALUE, nil),
-	}
-	attrs, err := c.ctx.GetAttributeValue(session, pubHandle, attrTemplate)
-	if err != nil || len(attrs) == 0 || len(attrs[0].Value) == 0 {
-		return nil, fmt.Errorf("failed to read public key CKA_VALUE: %w", err)
-	}
-
-	return attrs[0].Value, nil
+	return c.readValue(session, pubHandle, "public key")
 }
 
 func (c *Client) ExportPublicKeyPEM(tokenLabel, objectLabel, outputPath string) error {
@@ -446,11 +476,10 @@ func (c *Client) Decapsulate(tokenLabel, objectLabel, pinFilePath string, cipher
 		return nil, err
 	}
 
-	pinBytes, err := os.ReadFile(pinFilePath)
+	pin, err := ReadPINFile(pinFilePath)
 	if err != nil {
-		return nil, fmt.Errorf("could not read PIN file '%s': %w", pinFilePath, err)
+		return nil, err
 	}
-	pin := strings.TrimRight(string(pinBytes), "\r\n")
 
 	slotID, err := c.FindSlotByTokenLabel(tokenLabel)
 	if err != nil {
@@ -482,15 +511,14 @@ func (c *Client) Decapsulate(tokenLabel, objectLabel, pinFilePath string, cipher
 	}
 	defer c.ctx.DestroyObject(session, pkcs11.ObjectHandle(derivedKeyHandle))
 
-	valAttrs, err := c.ctx.GetAttributeValue(session, pkcs11.ObjectHandle(derivedKeyHandle), []*pkcs11.Attribute{
-		pkcs11.NewAttribute(pkcs11.CKA_VALUE, nil),
-	})
-	if err != nil || len(valAttrs) == 0 || len(valAttrs[0].Value) == 0 {
-		return nil, fmt.Errorf("failed to read derived shared secret CKA_VALUE: %w", err)
+	// The caller owns the returned secret and should clear() it after use.
+	sharedSecret, err := c.readValue(session, pkcs11.ObjectHandle(derivedKeyHandle), "derived shared secret")
+	if err != nil {
+		return nil, err
 	}
 
 	fmt.Printf("[+] HSM Decapsulation completed natively on server!\n")
-	return valAttrs[0].Value, nil
+	return sharedSecret, nil
 }
 
 func EncapsulateFromRawKey(rawKey []byte) (ciphertext []byte, sharedSecret []byte, algName string, err error) {
@@ -530,11 +558,46 @@ func EncapsulateFromPEM(pemPath string) (ciphertext []byte, sharedSecret []byte,
 	}
 
 	var spki SubjectPublicKeyInfo
-	if _, err := asn1.Unmarshal(block.Bytes, &spki); err != nil {
+	rest, err := asn1.Unmarshal(block.Bytes, &spki)
+	if err != nil {
 		return nil, nil, "", fmt.Errorf("failed to unmarshal SubjectPublicKeyInfo: %w", err)
 	}
+	if len(rest) != 0 {
+		return nil, nil, "", fmt.Errorf("invalid SubjectPublicKeyInfo: %d trailing bytes after DER structure", len(rest))
+	}
+	if len(spki.Algorithm.Parameters.FullBytes) != 0 {
+		return nil, nil, "", fmt.Errorf("invalid ML-KEM AlgorithmIdentifier: parameters must be absent")
+	}
 
-	return EncapsulateFromRawKey(spki.PublicKey.Bytes)
+	rawKey := spki.PublicKey.Bytes
+	if spki.PublicKey.BitLength != len(rawKey)*8 {
+		return nil, nil, "", fmt.Errorf("invalid public key BIT STRING: %d bits is not a whole number of bytes", spki.PublicKey.BitLength)
+	}
+
+	wantOID, name, ok := mlkemOIDForKeyLength(len(rawKey))
+	if !ok {
+		return nil, nil, "", fmt.Errorf("unexpected public key length: %d bytes", len(rawKey))
+	}
+	if !spki.Algorithm.Algorithm.Equal(wantOID) {
+		return nil, nil, "", fmt.Errorf("algorithm OID %s does not match %d-byte %s key (expected %s)",
+			spki.Algorithm.Algorithm, len(rawKey), name, wantOID)
+	}
+
+	return EncapsulateFromRawKey(rawKey)
+}
+
+// mlkemOIDForKeyLength maps an ML-KEM encapsulation key length to its NIST OID and name.
+func mlkemOIDForKeyLength(n int) (asn1.ObjectIdentifier, string, bool) {
+	switch n {
+	case 800:
+		return OIDMLKEM512, "ML-KEM-512", true
+	case 1184:
+		return OIDMLKEM768, "ML-KEM-768", true
+	case 1568:
+		return OIDMLKEM1024, "ML-KEM-1024", true
+	default:
+		return nil, "", false
+	}
 }
 
 func ParseMLKEMAlgorithm(alg string) (uint, error) {
@@ -551,20 +614,8 @@ func ParseMLKEMAlgorithm(alg string) (uint, error) {
 }
 
 func EncodeRawPublicKeyToPEM(rawKey []byte) ([]byte, string, error) {
-	var algOID asn1.ObjectIdentifier
-	var algName string
-
-	switch len(rawKey) {
-	case 800:
-		algOID = OIDMLKEM512
-		algName = "ML-KEM-512"
-	case 1184:
-		algOID = OIDMLKEM768
-		algName = "ML-KEM-768"
-	case 1568:
-		algOID = OIDMLKEM1024
-		algName = "ML-KEM-1024"
-	default:
+	algOID, algName, ok := mlkemOIDForKeyLength(len(rawKey))
+	if !ok {
 		return nil, "", fmt.Errorf("unexpected public key length: %d bytes (expected 800, 1184, or 1568)", len(rawKey))
 	}
 

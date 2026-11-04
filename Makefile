@@ -150,7 +150,10 @@ verify:
 # Display the Shared Secret Files: Sender (encap) & Receiver (decap)
 # ----------------------------------------------------------------------------
 
+# WARNING: prints raw key material. For local demo inspection only; deliberately
+# not part of 'demo', and must never run in CI or anywhere output is logged.
 show-secrets:
+	@echo -e "\033[0;33m[!] WARNING: printing raw shared-secret key material (demo use only; do not log or share)\033[0m"
 	@echo -e "\n--- Sender Shared Secret ---"
 	@pr -m -t -w 130 \
 	  <(xxd -g 1 $(SENDER_SECRET)) \
@@ -173,6 +176,7 @@ sym-enc: build
 	fi
 	@./$(BUILD_DIR)/$(BINARY_NAME) -sym-enc \
 	  -secret $(SENDER_SECRET) \
+	  -cipher $(CIPHERTEXT_FILE) \
 	  -in $(PLAIN_MSG_FILE) \
 	  -out $(ENC_MSG_FILE)
 
@@ -182,6 +186,7 @@ sym-dec: build
 	@rm -f $(DEC_MSG_FILE)
 	@./$(BUILD_DIR)/$(BINARY_NAME) -sym-dec \
 	  -secret $(RECEIVER_SECRET) \
+	  -cipher $(CIPHERTEXT_FILE) \
 	  -in $(ENC_MSG_FILE) \
 	  -out $(DEC_MSG_FILE)
 

@@ -93,7 +93,7 @@ func parseFlags(args []string) (*options, error) {
 	fs.StringVar(&o.pubOut, "o", "", "Output file path (for -p public key)")
 	fs.StringVar(&o.inFile, "in", "", "Input file path (-in <pubkey.pem> for -e, -in <msg.txt> for -sym-enc, -in <msg.enc> for -sym-dec)")
 	fs.StringVar(&o.outFile, "out", "", "Output file path for symmetric payload (-sym-enc / -sym-dec)")
-	fs.StringVar(&o.cipherFile, "cipher", "", "Path for KEM ciphertext file (-e output, -d input, default: ./ciphertext.bin)")
+	fs.StringVar(&o.cipherFile, "cipher", "", "KEM ciphertext file (-e output; -d, -sym-enc, -sym-dec input; default: ./ciphertext.bin)")
 	fs.StringVar(&o.secretFile, "secret", "", "Path for shared secret file (-e, -d, -sym-enc, -sym-dec)")
 	fs.StringVar(&o.salt, "salt", "", "Optional HKDF salt (default: '"+sym.DefaultSalt+"')")
 	fs.StringVar(&o.info, "info", "", "Optional HKDF context info (default: '"+sym.DefaultInfo+"')")
@@ -113,7 +113,7 @@ func parseFlags(args []string) (*options, error) {
 		fmt.Fprintf(w, "\nOptions:\n")
 		fmt.Fprintf(w, "  -in <path>              Input file path\n")
 		fmt.Fprintf(w, "  -out <path>             Output file path for symmetric payload\n")
-		fmt.Fprintf(w, "  -cipher <path>          KEM ciphertext file path (default: ./ciphertext.bin)\n")
+		fmt.Fprintf(w, "  -cipher <path>          KEM ciphertext file (-e output; -d/-sym-enc/-sym-dec input; default: ./ciphertext.bin)\n")
 		fmt.Fprintf(w, "  -secret <path>          Shared secret file path\n")
 		fmt.Fprintf(w, "  -salt <string>          HKDF salt\n")
 		fmt.Fprintf(w, "  -info <string>          HKDF domain separation context\n")
@@ -315,6 +315,8 @@ func runEncap(o *options, libPath string) error {
 			return fmt.Errorf("HSM key encapsulation failed: %w", err)
 		}
 	}
+	defer clear(sharedSecret)
+
 	if err := os.WriteFile(cipherPath, ciphertext, 0644); err != nil {
 		return fmt.Errorf("failed to write ciphertext: %w", err)
 	}
@@ -355,6 +357,7 @@ func runDecap(o *options, libPath string) error {
 	if err != nil {
 		return fmt.Errorf("decapsulation failed: %w", err)
 	}
+	defer clear(sharedSecret)
 
 	if err := writeSecretFile(secretPath, sharedSecret); err != nil {
 		return fmt.Errorf("failed to write shared secret: %w", err)
@@ -365,38 +368,51 @@ func runDecap(o *options, libPath string) error {
 	return nil
 }
 
-// deriveKey reads the shared secret and derives the AES-256 key.
-func deriveKey(o *options, defaultSecret string) ([]byte, error) {
+// deriveKey reads the shared secret and KEM ciphertext and derives the AES-256 key.
+// The caller must clear() the returned key.
+func deriveKey(o *options, defaultSecret string) (aesKey, kemCiphertext []byte, err error) {
 	secretPath := pathOr(o.secretFile, "HSM_SECRET_FILE", defaultSecret)
+	cipherPath := pathOr(o.cipherFile, "HSM_CIPHER_FILE", "./ciphertext.bin")
 
 	secret, err := os.ReadFile(secretPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read secret file '%s': %w", secretPath, err)
+		return nil, nil, fmt.Errorf("failed to read secret file '%s': %w", secretPath, err)
+	}
+	defer clear(secret)
+
+	kemCiphertext, err = os.ReadFile(cipherPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read KEM ciphertext file '%s' (bound into the AEAD tag): %w", cipherPath, err)
+	}
+	if err := hsm.ValidateMLKEMCiphertextLength(kemCiphertext); err != nil {
+		return nil, nil, fmt.Errorf("KEM ciphertext '%s': %w", cipherPath, err)
 	}
 
-	aesKey, err := sym.DeriveAES256Key(secret, []byte(o.salt), []byte(o.info))
+	aesKey, err = sym.DeriveAES256Key(secret, []byte(o.salt), []byte(o.info))
 	if err != nil {
-		return nil, fmt.Errorf("key derivation failed: %w", err)
+		return nil, nil, fmt.Errorf("key derivation failed: %w", err)
 	}
-	fmt.Printf("[*] Derived AES-256 key via HKDF-SHA256 (%d bytes)\n", len(aesKey))
-	return aesKey, nil
+	fmt.Printf("[*] Derived AES-256 key via HKDF-SHA256 (%d bytes), bound to KEM ciphertext %s\n", len(aesKey), cipherPath)
+	return aesKey, kemCiphertext, nil
 }
 
 func runSymEnc(o *options) error {
 	plainPath := pathOr(o.inFile, "PLAIN_MSG_FILE", "./msg.txt")
 	outPath := pathOr(o.outFile, "ENC_MSG_FILE", "./msg.enc")
 
-	aesKey, err := deriveKey(o, "./sender_secret.bin")
+	aesKey, kemCiphertext, err := deriveKey(o, "./sender_secret.bin")
 	if err != nil {
 		return err
 	}
+	defer clear(aesKey)
 
 	plaintext, err := os.ReadFile(plainPath)
 	if err != nil {
 		return fmt.Errorf("failed to read plaintext input file '%s': %w", plainPath, err)
 	}
+	defer clear(plaintext)
 
-	encrypted, err := sym.EncryptAESGCM(aesKey, plaintext)
+	encrypted, err := sym.EncryptAESGCM(aesKey, plaintext, kemCiphertext)
 	if err != nil {
 		return fmt.Errorf("encryption failed: %w", err)
 	}
@@ -407,7 +423,8 @@ func runSymEnc(o *options) error {
 
 	fmt.Printf("[+] AES-256-GCM Encryption successful!\n")
 	fmt.Printf("    Input Plaintext : %s (%d bytes)\n", plainPath, len(plaintext))
-	fmt.Printf("    Encrypted Output: %s (%d bytes [12B Nonce + Ciphertext + 16B Tag])\n", outPath, len(encrypted))
+	fmt.Printf("    Encrypted Output: %s (%d bytes [%dB header + %dB nonce + ciphertext + %dB tag])\n",
+		outPath, len(encrypted), len(sym.Header), sym.NonceSize, sym.TagSize)
 	return nil
 }
 
@@ -415,20 +432,22 @@ func runSymDec(o *options) error {
 	encPath := pathOr(o.inFile, "ENC_MSG_FILE", "./msg.enc")
 	outPath := pathOr(o.outFile, "DEC_MSG_FILE", "./msg.dec")
 
-	aesKey, err := deriveKey(o, "./receiver_secret.bin")
+	aesKey, kemCiphertext, err := deriveKey(o, "./receiver_secret.bin")
 	if err != nil {
 		return err
 	}
+	defer clear(aesKey)
 
 	encrypted, err := os.ReadFile(encPath)
 	if err != nil {
 		return fmt.Errorf("failed to read encrypted input file '%s': %w", encPath, err)
 	}
 
-	decrypted, err := sym.DecryptAESGCM(aesKey, encrypted)
+	decrypted, err := sym.DecryptAESGCM(aesKey, encrypted, kemCiphertext)
 	if err != nil {
 		return fmt.Errorf("decryption failed: %w", err)
 	}
+	defer clear(decrypted)
 
 	if err := writeSecretFile(outPath, decrypted); err != nil {
 		return fmt.Errorf("failed to write decrypted output: %w", err)
