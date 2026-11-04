@@ -24,6 +24,9 @@ ALGORITHM         ?= ML-KEM-768
 
 # Artifact Paths
 PUBKEY_FILE       ?= ./mlkem768_pub.pem
+# Expected SHA-256 fingerprint of PUBKEY_FILE (as printed by 'make extract-pk'),
+# obtained over a channel you trust; 'encap-pem' refuses a key that differs.
+PUBKEY_FINGERPRINT ?=
 CIPHERTEXT_FILE   ?= ./ciphertext.bin
 SENDER_SECRET     ?= ./sender_secret.bin
 RECEIVER_SECRET   ?= ./receiver_secret.bin
@@ -118,6 +121,8 @@ extract-pk: build
 	@$(EXEC_HSM) -p -o $(PUBKEY_FILE)
 	@echo -e "\n[*] Verifying PEM Structure with OpenSSL:"
 	@openssl pkey -pubin -in $(PUBKEY_FILE) -text -noout
+	@echo -e "\n[*] OpenSSL SHA-256 of SPKI DER (must equal the fingerprint above):"
+	@openssl pkey -pubin -in $(PUBKEY_FILE) -outform DER | openssl dgst -sha256 -r | cut -d' ' -f1
 
 # 4. Encapsulation via direct HSM public key lookup (No PEM needed)
 encap-hsm: build
@@ -131,7 +136,8 @@ encap-pem: build
 	@rm -f $(CIPHERTEXT_FILE) $(SENDER_SECRET)
 	@HSM_CIPHER_FILE="$(CIPHERTEXT_FILE)" \
 	 HSM_SECRET_FILE="$(SENDER_SECRET)" \
-	 ./$(BUILD_DIR)/$(BINARY_NAME) -e -in $(PUBKEY_FILE)
+	 ./$(BUILD_DIR)/$(BINARY_NAME) -e -in $(PUBKEY_FILE) \
+	   $(if $(PUBKEY_FINGERPRINT),-fingerprint $(PUBKEY_FINGERPRINT))
 
 # 5. Decapsulation on HSM using the private key
 decap: build

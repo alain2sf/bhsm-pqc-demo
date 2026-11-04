@@ -24,14 +24,15 @@ type options struct {
 	symDec    bool
 
 	// Options
-	pubOut     string // -o
-	inFile     string // -in
-	outFile    string // -out
-	cipherFile string // -cipher
-	secretFile string // -secret
-	salt       string
-	info       string
-	libPath    string
+	pubOut      string // -o
+	inFile      string // -in
+	outFile     string // -out
+	cipherFile  string // -cipher
+	secretFile  string // -secret
+	salt        string
+	info        string
+	libPath     string
+	fingerprint string // -fingerprint
 }
 
 func main() {
@@ -98,6 +99,7 @@ func parseFlags(args []string) (*options, error) {
 	fs.StringVar(&o.salt, "salt", "", "Optional HKDF salt (default: '"+sym.DefaultSalt+"')")
 	fs.StringVar(&o.info, "info", "", "Optional HKDF context info (default: '"+sym.DefaultInfo+"')")
 	fs.StringVar(&o.libPath, "lib", "", "Absolute path to BouncyHsm.Pkcs11Lib library (.dylib/.so)")
+	fs.StringVar(&o.fingerprint, "fingerprint", "", "Expected public key SHA-256 fingerprint for -e (as printed by -p)")
 
 	fs.Usage = func() {
 		w := fs.Output()
@@ -119,6 +121,7 @@ func parseFlags(args []string) (*options, error) {
 		fmt.Fprintf(w, "  -info <string>          HKDF domain separation context\n")
 		fmt.Fprintf(w, "  -o <path>               Output file path for public key (for -p)\n")
 		fmt.Fprintf(w, "  -lib <path>             Absolute path to PKCS#11 dynamic library (or PKCS11_LIB_PATH)\n")
+		fmt.Fprintf(w, "  -fingerprint <sha256>   Expected public key fingerprint for -e (as printed by -p; or HSM_PUBKEY_FINGERPRINT)\n")
 	}
 
 	if err := fs.Parse(args); err != nil {
@@ -138,6 +141,9 @@ func parseFlags(args []string) (*options, error) {
 		return nil, errors.New("no action specified")
 	case actions > 1:
 		return nil, errors.New("only one action flag can be specified at a time")
+	}
+	if o.fingerprint != "" && !o.encap {
+		return nil, errors.New("flag '-fingerprint' is only valid with '-e'")
 	}
 
 	return o, nil
@@ -281,16 +287,14 @@ func runEncap(o *options, libPath string) error {
 		pubPEM = os.Getenv("HSM_PUBKEY_FILE")
 	}
 
-	var ciphertext, sharedSecret []byte
-	var algName string
-	var err error
-
+	var rawKey []byte
 	if pubPEM != "" {
 		fmt.Printf("[*] Reading public key from PEM file: %s\n", pubPEM)
-		ciphertext, sharedSecret, algName, err = hsm.EncapsulateFromPEM(pubPEM)
+		k, err := hsm.ReadPublicKeyPEM(pubPEM)
 		if err != nil {
-			return fmt.Errorf("PEM encapsulation failed: %w", err)
+			return fmt.Errorf("PEM public key rejected: %w", err)
 		}
+		rawKey = k
 	} else {
 		env, err := requireEnvs("HSM_TOKEN_LABEL", "HSM_OBJECT_LABEL")
 		if err != nil {
@@ -305,15 +309,39 @@ func runEncap(o *options, libPath string) error {
 		}
 		defer client.Close()
 
-		rawKey, err := client.FetchRawPublicKey(tokenLabel, objectLabel)
+		k, err := client.FetchRawPublicKey(tokenLabel, objectLabel)
 		if err != nil {
 			return fmt.Errorf("public key retrieval failed: %w", err)
 		}
+		rawKey = k
+	}
 
-		ciphertext, sharedSecret, algName, err = hsm.EncapsulateFromRawKey(rawKey)
+	// The PEM file is only as trustworthy as the channel it arrived over, so a
+	// sender can pin the fingerprint that -p printed next to the HSM.
+	want := o.fingerprint
+	if want == "" {
+		want = os.Getenv("HSM_PUBKEY_FINGERPRINT")
+	}
+	if want != "" {
+		fp, err := hsm.CheckPublicKeyFingerprint(rawKey, want)
 		if err != nil {
-			return fmt.Errorf("HSM key encapsulation failed: %w", err)
+			return err
 		}
+		fmt.Printf("[+] Public key fingerprint verified: %s\n", fp)
+	} else {
+		fp, err := hsm.PublicKeyFingerprint(rawKey)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("[*] Public key fingerprint: %s\n", fp)
+		if pubPEM != "" {
+			fmt.Println("[!] Warning: PEM key not pinned; compare the fingerprint above with the one from '-p', or pass -fingerprint")
+		}
+	}
+
+	ciphertext, sharedSecret, algName, err := hsm.EncapsulateFromRawKey(rawKey)
+	if err != nil {
+		return fmt.Errorf("encapsulation failed: %w", err)
 	}
 	defer clear(sharedSecret)
 

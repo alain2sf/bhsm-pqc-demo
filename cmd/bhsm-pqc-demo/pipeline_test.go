@@ -16,6 +16,7 @@ import (
 func TestRun_OfflinePipeline(t *testing.T) {
 	t.Setenv("PKCS11_LIB_PATH", "")
 	t.Setenv("HSM_PUBKEY_FILE", "")
+	t.Setenv("HSM_PUBKEY_FINGERPRINT", "")
 	dir := t.TempDir()
 	p := func(name string) string { return filepath.Join(dir, name) }
 

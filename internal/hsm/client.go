@@ -3,9 +3,12 @@
 package hsm
 
 import (
+	"bytes"
 	"crypto/mlkem"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/asn1"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"os"
@@ -449,7 +452,12 @@ func (c *Client) ExportPublicKeyPEM(tokenLabel, objectLabel, outputPath string) 
 	if err != nil {
 		return err
 	}
+	fingerprint, err := PublicKeyFingerprint(rawPubKey)
+	if err != nil {
+		return err
+	}
 	fmt.Printf("[*] Extracted %s raw public key (%d bytes)\n", algName, len(rawPubKey))
+	fmt.Printf("[*] Fingerprint  : %s\n", fingerprint)
 
 	if err := os.WriteFile(outputPath, pemBytes, 0644); err != nil {
 		return fmt.Errorf("failed to write PEM output to '%s': %w", outputPath, err)
@@ -546,44 +554,111 @@ func EncapsulateFromRawKey(rawKey []byte) (ciphertext []byte, sharedSecret []byt
 	}
 }
 
+// EncapsulateFromPEM reads and validates an ML-KEM SPKI PEM file, then
+// encapsulates against it. It does not check where the key came from: callers
+// that need that should use ReadPublicKeyPEM and CheckPublicKeyFingerprint.
 func EncapsulateFromPEM(pemPath string) (ciphertext []byte, sharedSecret []byte, algName string, err error) {
+	rawKey, err := ReadPublicKeyPEM(pemPath)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return EncapsulateFromRawKey(rawKey)
+}
+
+// ReadPublicKeyPEM reads an ML-KEM SubjectPublicKeyInfo PEM file and returns the
+// raw encapsulation key after strict structural checks (no trailing DER, absent
+// parameters, whole-byte BIT STRING, OID matching the key length).
+func ReadPublicKeyPEM(pemPath string) ([]byte, error) {
 	pemData, err := os.ReadFile(pemPath)
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("failed to read public key PEM file '%s': %w", pemPath, err)
+		return nil, fmt.Errorf("failed to read public key PEM file '%s': %w", pemPath, err)
 	}
 
 	block, _ := pem.Decode(pemData)
 	if block == nil || block.Type != "PUBLIC KEY" {
-		return nil, nil, "", fmt.Errorf("invalid PEM file: missing 'PUBLIC KEY' block")
+		return nil, fmt.Errorf("invalid PEM file: missing 'PUBLIC KEY' block")
 	}
 
 	var spki SubjectPublicKeyInfo
 	rest, err := asn1.Unmarshal(block.Bytes, &spki)
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("failed to unmarshal SubjectPublicKeyInfo: %w", err)
+		return nil, fmt.Errorf("failed to unmarshal SubjectPublicKeyInfo: %w", err)
 	}
 	if len(rest) != 0 {
-		return nil, nil, "", fmt.Errorf("invalid SubjectPublicKeyInfo: %d trailing bytes after DER structure", len(rest))
+		return nil, fmt.Errorf("invalid SubjectPublicKeyInfo: %d trailing bytes after DER structure", len(rest))
 	}
 	if len(spki.Algorithm.Parameters.FullBytes) != 0 {
-		return nil, nil, "", fmt.Errorf("invalid ML-KEM AlgorithmIdentifier: parameters must be absent")
+		return nil, fmt.Errorf("invalid ML-KEM AlgorithmIdentifier: parameters must be absent")
 	}
 
 	rawKey := spki.PublicKey.Bytes
 	if spki.PublicKey.BitLength != len(rawKey)*8 {
-		return nil, nil, "", fmt.Errorf("invalid public key BIT STRING: %d bits is not a whole number of bytes", spki.PublicKey.BitLength)
+		return nil, fmt.Errorf("invalid public key BIT STRING: %d bits is not a whole number of bytes", spki.PublicKey.BitLength)
 	}
 
 	wantOID, name, ok := mlkemOIDForKeyLength(len(rawKey))
 	if !ok {
-		return nil, nil, "", fmt.Errorf("unexpected public key length: %d bytes", len(rawKey))
+		return nil, fmt.Errorf("unexpected public key length: %d bytes", len(rawKey))
 	}
 	if !spki.Algorithm.Algorithm.Equal(wantOID) {
-		return nil, nil, "", fmt.Errorf("algorithm OID %s does not match %d-byte %s key (expected %s)",
+		return nil, fmt.Errorf("algorithm OID %s does not match %d-byte %s key (expected %s)",
 			spki.Algorithm.Algorithm, len(rawKey), name, wantOID)
 	}
 
-	return EncapsulateFromRawKey(rawKey)
+	return rawKey, nil
+}
+
+// FingerprintPrefix labels fingerprints printed by the CLI; it is optional on input.
+const FingerprintPrefix = "SHA256:"
+
+// PublicKeyFingerprint returns "SHA256:" followed by the lowercase hex SHA-256 of
+// the key's canonical DER SubjectPublicKeyInfo. Hashing the canonical encoding
+// (rather than the file bytes) makes the HSM key and its PEM export produce the
+// same value, equal to:
+//
+//	openssl pkey -pubin -in key.pem -outform DER | openssl dgst -sha256
+func PublicKeyFingerprint(rawKey []byte) (string, error) {
+	der, _, err := marshalSPKI(rawKey)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(der)
+	return FingerprintPrefix + hex.EncodeToString(sum[:]), nil
+}
+
+// ParseFingerprint accepts a SHA-256 fingerprint as 64 hex digits, optionally
+// prefixed with "SHA256:" (any case) and/or separated by colons, and returns the
+// 32-byte digest.
+func ParseFingerprint(s string) ([]byte, error) {
+	v := strings.TrimSpace(s)
+	if len(v) >= len(FingerprintPrefix) && strings.EqualFold(v[:len(FingerprintPrefix)], FingerprintPrefix) {
+		v = v[len(FingerprintPrefix):]
+	}
+	v = strings.ReplaceAll(v, ":", "")
+	digest, err := hex.DecodeString(v)
+	if err != nil || len(digest) != sha256.Size {
+		return nil, fmt.Errorf("invalid fingerprint %q: expected %d hex digits (optionally prefixed %q)", s, 2*sha256.Size, FingerprintPrefix)
+	}
+	return digest, nil
+}
+
+// CheckPublicKeyFingerprint returns the key's fingerprint, and an error if it
+// differs from want (see ParseFingerprint for accepted forms).
+func CheckPublicKeyFingerprint(rawKey []byte, want string) (string, error) {
+	wantDigest, err := ParseFingerprint(want)
+	if err != nil {
+		return "", err
+	}
+	got, err := PublicKeyFingerprint(rawKey)
+	if err != nil {
+		return "", err
+	}
+	gotDigest, _ := ParseFingerprint(got)
+	if !bytes.Equal(gotDigest, wantDigest) {
+		return got, fmt.Errorf("public key fingerprint mismatch: got %s, expected %s%s",
+			got, FingerprintPrefix, hex.EncodeToString(wantDigest))
+	}
+	return got, nil
 }
 
 // mlkemOIDForKeyLength maps an ML-KEM encapsulation key length to its NIST OID and name.
@@ -613,7 +688,8 @@ func ParseMLKEMAlgorithm(alg string) (uint, error) {
 	}
 }
 
-func EncodeRawPublicKeyToPEM(rawKey []byte) ([]byte, string, error) {
+// marshalSPKI wraps a raw ML-KEM encapsulation key in a DER SubjectPublicKeyInfo.
+func marshalSPKI(rawKey []byte) ([]byte, string, error) {
 	algOID, algName, ok := mlkemOIDForKeyLength(len(rawKey))
 	if !ok {
 		return nil, "", fmt.Errorf("unexpected public key length: %d bytes (expected 800, 1184, or 1568)", len(rawKey))
@@ -632,6 +708,14 @@ func EncodeRawPublicKeyToPEM(rawKey []byte) ([]byte, string, error) {
 	derBytes, err := asn1.Marshal(spki)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to marshal ASN.1 SubjectPublicKeyInfo: %w", err)
+	}
+	return derBytes, algName, nil
+}
+
+func EncodeRawPublicKeyToPEM(rawKey []byte) ([]byte, string, error) {
+	derBytes, algName, err := marshalSPKI(rawKey)
+	if err != nil {
+		return nil, "", err
 	}
 
 	pemBlock := &pem.Block{

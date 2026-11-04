@@ -131,6 +131,7 @@ See “BouncyHSM & OpenSSL Runbook (Demo Prototype) v1.0” [`BouncyHSM-OpenSSL-
 | `HSM_OBJECT_LABEL` | Identifier attached to the public/private key pair | `mlkem768-demo` |
 | `HSM_PIN_FILE` | Path to the file storing the User PIN | `./DemoSlotToken1.pin` |
 | `PUBKEY_FILE` | Path to the exported public key PEM file | `./mlkem768_pub.pem` |
+| `PUBKEY_FINGERPRINT` | Expected public key fingerprint for `encap-pem` (empty: not pinned, warn only) | *(empty)* |
 | `CIPHERTEXT_FILE` | Path for KEM ciphertext file | `./ciphertext.bin` |
 | `SENDER_SECRET` | Path for sender's shared secret | `./sender_secret.bin` |
 | `RECEIVER_SECRET` | Path for receiver's shared secret | `./receiver_secret.bin` |
@@ -178,11 +179,14 @@ openssl genpkey -provider pkcs11prov -provider default -algorithm ML-KEM-768 \
 ---
 
 ### Step 3: Extract Public Key to PEM (`make extract-pk`)
-Opens a public (unauthenticated i.e. no PIN required) session to the HSM, locates the public key object, extracts the raw 1184-byte key material, formats it into an ASN.1 `SubjectPublicKeyInfo` container (using NIST OID `2.16.840.1.101.3.4.4.2`), and saves it to a standard PEM file:
+Opens a public (unauthenticated i.e. no PIN required) session to the HSM, locates the public key object, extracts the raw 1184-byte key material, formats it into an ASN.1 `SubjectPublicKeyInfo` container (using NIST OID `2.16.840.1.101.3.4.4.2`), and saves it to a standard PEM file. It also prints the key's **SHA-256 fingerprint** (the SHA-256 of the DER `SubjectPublicKeyInfo`), and recomputes it with OpenSSL as a cross-check:
 
 ```bash
 make extract-pk
+# [*] Fingerprint  : SHA256:e88dec6e...532a1f91
 ```
+
+The PEM file carries no proof of origin: anyone who can replace it in transit can make the sender encrypt to their own key. Hand the fingerprint to the sender over a channel you trust, so they can pin it in Step 4.
 
 #### Equivalent OpenSSL Command:
 ```bash
@@ -202,6 +206,15 @@ make encap-hsm
 
 # Or offline using the exported PEM file and encapsulate:
 make encap-pem
+
+# Same, but refuse the PEM unless it matches the fingerprint printed by extract-pk:
+make encap-pem PUBKEY_FINGERPRINT=SHA256:e88dec6e...532a1f91
+```
+
+Without a pinned fingerprint, `-e -in` prints the key's fingerprint and a warning. With `-fingerprint` (or `HSM_PUBKEY_FINGERPRINT`), a mismatch aborts before any ciphertext or secret is written. The accepted forms are 64 hex digits, optionally prefixed `SHA256:` and/or separated by colons. To compute the fingerprint independently:
+
+```bash
+openssl pkey -pubin -in mlkem768_pub.pem -outform DER | openssl dgst -sha256
 ```
 
 #### Equivalent OpenSSL Command:
@@ -310,6 +323,7 @@ Options:
   -info <string>          HKDF domain separation context
   -o <path>               Output file path for public key (for -p)
   -lib <path>             Absolute path to PKCS#11 dynamic library (or PKCS11_LIB_PATH)
+  -fingerprint <sha256>   Expected public key fingerprint for -e (as printed by -p; or HSM_PUBKEY_FINGERPRINT)
 
   Environment Variables:
   BOUNCY_HSM_CFG_STRING   HSM server configuration string
@@ -318,6 +332,7 @@ Options:
   HSM_OBJECT_LABEL        Object/key label
   HSM_PIN_FILE            Path to token PIN file (for -g and -d)
   HSM_PUBKEY_FILE         Fallback input public key PEM file (for -e)
+  HSM_PUBKEY_FINGERPRINT  Fallback expected public key fingerprint (for -e)
   HSM_CIPHER_FILE         Fallback ciphertext file path
   HSM_SECRET_FILE         Fallback shared secret file path
 ```
