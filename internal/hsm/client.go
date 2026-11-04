@@ -3,9 +3,15 @@
 package hsm
 
 import (
+	"bytes"
 	"crypto/mlkem"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/asn1"
+	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -27,6 +33,13 @@ const (
 	CKP_ML_KEM_512  = 1
 	CKP_ML_KEM_768  = 2
 	CKP_ML_KEM_1024 = 3
+)
+
+// FIPS 203 ML-KEM ciphertext sizes in bytes.
+const (
+	MLKEM512CiphertextSize  = 768
+	MLKEM768CiphertextSize  = 1088
+	MLKEM1024CiphertextSize = 1568
 )
 
 // NIST FIPS 203 / IETF OIDs for ML-KEM
@@ -182,9 +195,62 @@ func (c *Client) GetUniqueID(session pkcs11.SessionHandle, obj pkcs11.ObjectHand
 	return strVal
 }
 
+// findObjects returns every object handle matching the template.
+func (c *Client) findObjects(session pkcs11.SessionHandle, template []*pkcs11.Attribute) ([]pkcs11.ObjectHandle, error) {
+	if err := c.ctx.FindObjectsInit(session, template); err != nil {
+		return nil, fmt.Errorf("C_FindObjectsInit failed: %w", err)
+	}
+
+	var all []pkcs11.ObjectHandle
+	for {
+		objs, _, err := c.ctx.FindObjects(session, 50)
+		if err != nil {
+			_ = c.ctx.FindObjectsFinal(session)
+			return nil, fmt.Errorf("C_FindObjects failed: %w", err)
+		}
+		if len(objs) == 0 {
+			break
+		}
+		all = append(all, objs...)
+	}
+
+	if err := c.ctx.FindObjectsFinal(session); err != nil {
+		return nil, fmt.Errorf("C_FindObjectsFinal failed: %w", err)
+	}
+	return all, nil
+}
+
+// findUniqueMLKEMKey locates exactly one ML-KEM key of the given class and label.
+// Zero matches or more than one match are errors: an ambiguous label could let a
+// planted object stand in for the real key.
+func (c *Client) findUniqueMLKEMKey(session pkcs11.SessionHandle, class uint, objectLabel, tokenLabel string) (pkcs11.ObjectHandle, error) {
+	kind := "public"
+	if class == pkcs11.CKO_PRIVATE_KEY {
+		kind = "private"
+	}
+
+	objs, err := c.findObjects(session, []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_CLASS, class),
+		pkcs11.NewAttribute(pkcs11.CKA_KEY_TYPE, CKK_ML_KEM),
+		pkcs11.NewAttribute(pkcs11.CKA_LABEL, objectLabel),
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	switch len(objs) {
+	case 0:
+		return 0, fmt.Errorf("ML-KEM %s key '%s' not found on token '%s'", kind, objectLabel, tokenLabel)
+	case 1:
+		return objs[0], nil
+	default:
+		return 0, fmt.Errorf("ambiguous: %d ML-KEM %s keys labelled '%s' on token '%s'", len(objs), kind, objectLabel, tokenLabel)
+	}
+}
+
 // DeleteObjectsByLabel searches for, logs CKA_UNIQUE_ID, and deletes all existing
-// objects matching the specified label on the active token.
-func (c *Client) DeleteObjectsByLabel(session pkcs11.SessionHandle, objectLabel string) error {
+// objects matching the specified label on the active token, except handles in keep.
+func (c *Client) DeleteObjectsByLabel(session pkcs11.SessionHandle, objectLabel string, keep map[pkcs11.ObjectHandle]bool) error {
 	classes := []struct {
 		id   uint
 		name string
@@ -197,40 +263,28 @@ func (c *Client) DeleteObjectsByLabel(session pkcs11.SessionHandle, objectLabel 
 	var deletedLog []string
 
 	for _, cls := range classes {
-		template := []*pkcs11.Attribute{
+		// Collect handles first, then destroy outside the active search.
+		objs, err := c.findObjects(session, []*pkcs11.Attribute{
 			pkcs11.NewAttribute(pkcs11.CKA_CLASS, cls.id),
 			pkcs11.NewAttribute(pkcs11.CKA_LABEL, objectLabel),
+		})
+		if err != nil {
+			return fmt.Errorf("%s search failed: %w", cls.name, err)
 		}
 
-		if err := c.ctx.FindObjectsInit(session, template); err != nil {
-			return fmt.Errorf("FindObjectsInit failed for %s: %w", cls.name, err)
-		}
-
-		for {
-			objs, _, err := c.ctx.FindObjects(session, 50)
-			if err != nil {
-				_ = c.ctx.FindObjectsFinal(session)
-				return fmt.Errorf("FindObjects failed for %s: %w", cls.name, err)
-			}
-			if len(objs) == 0 {
-				break
+		for _, obj := range objs {
+			if keep[obj] {
+				continue
 			}
 
-			for _, obj := range objs {
-				// Query CKA_UNIQUE_ID before destroying the object
-				uniqueID := c.GetUniqueID(session, obj)
+			// Query CKA_UNIQUE_ID before destroying the object
+			uniqueID := c.GetUniqueID(session, obj)
 
-				if err := c.ctx.DestroyObject(session, obj); err != nil {
-					_ = c.ctx.FindObjectsFinal(session)
-					return fmt.Errorf("failed to destroy %s (handle %d): %w", cls.name, obj, err)
-				}
-
-				deletedLog = append(deletedLog, fmt.Sprintf("    -> Deleted %-11s (Handle: %d, CKA_UNIQUE_ID: %s)", cls.name, obj, uniqueID))
+			if err := c.ctx.DestroyObject(session, obj); err != nil {
+				return fmt.Errorf("failed to destroy %s (handle %d): %w", cls.name, obj, err)
 			}
-		}
 
-		if err := c.ctx.FindObjectsFinal(session); err != nil {
-			return fmt.Errorf("FindObjectsFinal failed for %s: %w", cls.name, err)
+			deletedLog = append(deletedLog, fmt.Sprintf("    -> Deleted %-11s (Handle: %d, CKA_UNIQUE_ID: %s)", cls.name, obj, uniqueID))
 		}
 	}
 
@@ -246,17 +300,55 @@ func (c *Client) DeleteObjectsByLabel(session pkcs11.SessionHandle, objectLabel 
 	return nil
 }
 
+// ReadPINFile reads the token user PIN, refusing files that group or others can
+// access. The raw buffer is cleared after use; the returned string cannot be
+// (Go strings are immutable), so callers should keep it no longer than needed.
+func ReadPINFile(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("could not stat PIN file '%s': %w", path, err)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return "", fmt.Errorf("PIN file '%s' has permissions %04o; it must not be accessible by group or others (run: chmod 600 %s)", path, perm, path)
+	}
+
+	pinBytes, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("could not read PIN file '%s': %w", path, err)
+	}
+	defer clear(pinBytes)
+
+	pin := strings.TrimRight(string(pinBytes), "\r\n")
+	if pin == "" {
+		return "", fmt.Errorf("PIN file '%s' is empty", path)
+	}
+	return pin, nil
+}
+
+// readValue reads a non-empty CKA_VALUE, reporting PKCS#11 errors and empty values separately.
+func (c *Client) readValue(session pkcs11.SessionHandle, obj pkcs11.ObjectHandle, what string) ([]byte, error) {
+	attrs, err := c.ctx.GetAttributeValue(session, obj, []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_VALUE, nil),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %s CKA_VALUE: %w", what, err)
+	}
+	if len(attrs) == 0 || len(attrs[0].Value) == 0 {
+		return nil, fmt.Errorf("%s CKA_VALUE is empty", what)
+	}
+	return attrs[0].Value, nil
+}
+
 func (c *Client) GenerateMLKEMKeyPair(tokenLabel, objectLabel, pinFilePath, algorithm string) error {
 	paramSet, err := ParseMLKEMAlgorithm(algorithm)
 	if err != nil {
 		return err
 	}
 
-	pinBytes, err := os.ReadFile(pinFilePath)
+	pin, err := ReadPINFile(pinFilePath)
 	if err != nil {
-		return fmt.Errorf("could not read PIN file '%s': %w", pinFilePath, err)
+		return err
 	}
-	pin := strings.TrimRight(string(pinBytes), "\r\n")
 
 	slotID, err := c.FindSlotByTokenLabel(tokenLabel)
 	if err != nil {
@@ -275,12 +367,13 @@ func (c *Client) GenerateMLKEMKeyPair(tokenLabel, objectLabel, pinFilePath, algo
 	}
 	defer c.ctx.Logout(session)
 
-	// Clean up any existing keys matching the label before generating new ones
-	if err := c.DeleteObjectsByLabel(session, objectLabel); err != nil {
-		return fmt.Errorf("pre-generation cleanup failed: %w", err)
-	}
-
 	fmt.Printf("[*] Generating %s key pair (Object Label: '%s')...\n", algorithm, objectLabel)
+
+	// Random CKA_ID shared by both halves so the pair can be matched unambiguously.
+	keyID := make([]byte, 16)
+	if _, err := rand.Read(keyID); err != nil {
+		return fmt.Errorf("failed to generate CKA_ID: %w", err)
+	}
 
 	mech := []*pkcs11.Mechanism{
 		pkcs11.NewMechanism(CKM_ML_KEM_KEY_PAIR_GEN, nil),
@@ -290,6 +383,7 @@ func (c *Client) GenerateMLKEMKeyPair(tokenLabel, objectLabel, pinFilePath, algo
 		pkcs11.NewAttribute(pkcs11.CKA_TOKEN, true),
 		pkcs11.NewAttribute(pkcs11.CKA_PRIVATE, false),
 		pkcs11.NewAttribute(pkcs11.CKA_LABEL, objectLabel),
+		pkcs11.NewAttribute(pkcs11.CKA_ID, keyID),
 		pkcs11.NewAttribute(CKA_PARAMETER_SET, paramSet),
 		pkcs11.NewAttribute(CKA_ENCAPSULATE, true),
 	}
@@ -298,14 +392,24 @@ func (c *Client) GenerateMLKEMKeyPair(tokenLabel, objectLabel, pinFilePath, algo
 		pkcs11.NewAttribute(pkcs11.CKA_TOKEN, true),
 		pkcs11.NewAttribute(pkcs11.CKA_PRIVATE, true),
 		pkcs11.NewAttribute(pkcs11.CKA_SENSITIVE, true),
+		pkcs11.NewAttribute(pkcs11.CKA_EXTRACTABLE, false),
 		pkcs11.NewAttribute(pkcs11.CKA_LABEL, objectLabel),
+		pkcs11.NewAttribute(pkcs11.CKA_ID, keyID),
 		pkcs11.NewAttribute(CKA_PARAMETER_SET, paramSet),
 		pkcs11.NewAttribute(CKA_DECAPSULATE, true),
 	}
 
+	// Generate first, so a failure here leaves any existing key pair intact.
 	pubHandle, privHandle, err := c.ctx.GenerateKeyPair(session, mech, pubTemplate, privTemplate)
 	if err != nil {
-		return fmt.Errorf("C_GenerateKeyPair failed: %w", err)
+		return fmt.Errorf("C_GenerateKeyPair failed (existing keys left untouched): %w", err)
+	}
+
+	// Now remove the previous objects with this label, keeping the new pair.
+	keep := map[pkcs11.ObjectHandle]bool{pubHandle: true, privHandle: true}
+	if err := c.DeleteObjectsByLabel(session, objectLabel, keep); err != nil {
+		return fmt.Errorf("new key pair created (pub %d, priv %d) but cleanup of old '%s' objects failed; "+
+			"lookups will refuse the label as ambiguous until it is resolved: %w", pubHandle, privHandle, objectLabel, err)
 	}
 
 	// Query CKA_UNIQUE_ID for both generated keys
@@ -320,7 +424,14 @@ func (c *Client) GenerateMLKEMKeyPair(tokenLabel, objectLabel, pinFilePath, algo
 	return nil
 }
 
-func (c *Client) FetchRawPublicKey(tokenLabel, objectLabel string) ([]byte, error) {
+// FetchRawPublicKey reads the ML-KEM public key labelled objectLabel.
+//
+// With an empty pinFilePath it uses a public session and only checks that the
+// label is unambiguous. With a PIN file it logs in and also proves the public key
+// belongs to the private key of the same label (see verifyKeyPair). This matters
+// because the public object can be replaced without the PIN, and whoever holds
+// the matching private key could then read everything encrypted to it.
+func (c *Client) FetchRawPublicKey(tokenLabel, objectLabel, pinFilePath string) ([]byte, error) {
 	slotID, err := c.FindSlotByTokenLabel(tokenLabel)
 	if err != nil {
 		return nil, err
@@ -328,43 +439,108 @@ func (c *Client) FetchRawPublicKey(tokenLabel, objectLabel string) ([]byte, erro
 
 	session, err := c.ctx.OpenSession(slotID, pkcs11.CKF_SERIAL_SESSION)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open public session on slot %d: %w", slotID, err)
+		return nil, fmt.Errorf("failed to open session on slot %d: %w", slotID, err)
 	}
 	defer c.ctx.CloseSession(session)
 
-	template := []*pkcs11.Attribute{
-		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PUBLIC_KEY),
-		pkcs11.NewAttribute(pkcs11.CKA_LABEL, objectLabel),
+	if pinFilePath != "" {
+		pin, err := ReadPINFile(pinFilePath)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.ctx.Login(session, pkcs11.CKU_USER, pin); err != nil {
+			return nil, fmt.Errorf("failed to login to token: %w", err)
+		}
+		defer c.ctx.Logout(session)
 	}
 
-	if err := c.ctx.FindObjectsInit(session, template); err != nil {
-		return nil, fmt.Errorf("C_FindObjectsInit failed: %w", err)
-	}
-
-	objs, _, err := c.ctx.FindObjects(session, 1)
+	pubHandle, err := c.findUniqueMLKEMKey(session, pkcs11.CKO_PUBLIC_KEY, objectLabel, tokenLabel)
 	if err != nil {
-		_ = c.ctx.FindObjectsFinal(session)
-		return nil, fmt.Errorf("C_FindObjects failed: %w", err)
-	}
-	_ = c.ctx.FindObjectsFinal(session)
-
-	if len(objs) == 0 {
-		return nil, fmt.Errorf("public key '%s' not found on token '%s'", objectLabel, tokenLabel)
+		return nil, err
 	}
 
-	attrTemplate := []*pkcs11.Attribute{
-		pkcs11.NewAttribute(pkcs11.CKA_VALUE, nil),
-	}
-	attrs, err := c.ctx.GetAttributeValue(session, objs[0], attrTemplate)
-	if err != nil || len(attrs) == 0 || len(attrs[0].Value) == 0 {
-		return nil, fmt.Errorf("failed to read public key CKA_VALUE: %w", err)
+	rawKey, err := c.readValue(session, pubHandle, "public key")
+	if err != nil {
+		return nil, err
 	}
 
+	if pinFilePath == "" {
+		fmt.Println("[!] Warning: no HSM_PIN_FILE set; public/private key pairing not verified")
+		return rawKey, nil
+	}
+	if err := c.verifyKeyPair(session, pubHandle, rawKey, objectLabel, tokenLabel); err != nil {
+		return nil, err
+	}
+	return rawKey, nil
+}
+
+// verifyKeyPair checks, in a logged-in session, that the public key belongs to the
+// unique private key of the same label:
+//
+//  1. both carry the same non-empty CKA_ID (set at keygen; catches stale or
+//     mismatched objects, but CKA_ID is public and can be copied);
+//  2. a fresh local encapsulation to rawKey decapsulates on the HSM to the same
+//     shared secret, which only the matching private key can do.
+//
+// ML-KEM-512 cannot be encapsulated locally, so only step 1 runs for it.
+func (c *Client) verifyKeyPair(session pkcs11.SessionHandle, pubHandle pkcs11.ObjectHandle, rawKey []byte, objectLabel, tokenLabel string) error {
+	privHandle, err := c.findUniqueMLKEMKey(session, pkcs11.CKO_PRIVATE_KEY, objectLabel, tokenLabel)
+	if err != nil {
+		return err
+	}
+
+	pubID, err := c.readID(session, pubHandle, "public key")
+	if err != nil {
+		return err
+	}
+	privID, err := c.readID(session, privHandle, "private key")
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(pubID, privID) {
+		return fmt.Errorf("key pair mismatch: public key CKA_ID %x differs from private key CKA_ID %x", pubID, privID)
+	}
+
+	if len(rawKey) == 800 {
+		fmt.Printf("[!] Warning: ML-KEM-512 cannot be encapsulated locally; pairing checked by CKA_ID (%x) only\n", pubID)
+		return nil
+	}
+
+	ciphertext, want, _, err := EncapsulateFromRawKey(rawKey)
+	if err != nil {
+		return fmt.Errorf("pairing check encapsulation failed: %w", err)
+	}
+	defer clear(want)
+
+	got, err := c.decapsulateWith(session, privHandle, ciphertext)
+	if err != nil {
+		return fmt.Errorf("pairing check decapsulation failed: %w", err)
+	}
+	defer clear(got)
+
+	if subtle.ConstantTimeCompare(got, want) != 1 {
+		return errors.New("key pair mismatch: the HSM private key does not decapsulate to the public key's shared secret")
+	}
+	fmt.Printf("[+] Key pair verified: CKA_ID %x, encapsulation round-trip on HSM succeeded\n", pubID)
+	return nil
+}
+
+// readID reads a non-empty CKA_ID.
+func (c *Client) readID(session pkcs11.SessionHandle, obj pkcs11.ObjectHandle, what string) ([]byte, error) {
+	attrs, err := c.ctx.GetAttributeValue(session, obj, []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_ID, nil),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %s CKA_ID: %w", what, err)
+	}
+	if len(attrs) == 0 || len(attrs[0].Value) == 0 {
+		return nil, fmt.Errorf("%s has no CKA_ID (generated before key pairing was recorded? re-run -g)", what)
+	}
 	return attrs[0].Value, nil
 }
 
-func (c *Client) ExportPublicKeyPEM(tokenLabel, objectLabel, outputPath string) error {
-	rawPubKey, err := c.FetchRawPublicKey(tokenLabel, objectLabel)
+func (c *Client) ExportPublicKeyPEM(tokenLabel, objectLabel, pinFilePath, outputPath string) error {
+	rawPubKey, err := c.FetchRawPublicKey(tokenLabel, objectLabel, pinFilePath)
 	if err != nil {
 		return err
 	}
@@ -373,7 +549,12 @@ func (c *Client) ExportPublicKeyPEM(tokenLabel, objectLabel, outputPath string) 
 	if err != nil {
 		return err
 	}
+	fingerprint, err := PublicKeyFingerprint(rawPubKey)
+	if err != nil {
+		return err
+	}
 	fmt.Printf("[*] Extracted %s raw public key (%d bytes)\n", algName, len(rawPubKey))
+	fmt.Printf("[*] Fingerprint  : %s\n", fingerprint)
 
 	if err := os.WriteFile(outputPath, pemBytes, 0644); err != nil {
 		return fmt.Errorf("failed to write PEM output to '%s': %w", outputPath, err)
@@ -383,12 +564,27 @@ func (c *Client) ExportPublicKeyPEM(tokenLabel, objectLabel, outputPath string) 
 	return nil
 }
 
-func (c *Client) Decapsulate(tokenLabel, objectLabel, pinFilePath string, ciphertext []byte) ([]byte, error) {
-	pinBytes, err := os.ReadFile(pinFilePath)
-	if err != nil {
-		return nil, fmt.Errorf("could not read PIN file '%s': %w", pinFilePath, err)
+// ValidateMLKEMCiphertextLength rejects ciphertexts whose length matches no
+// ML-KEM parameter set (FIPS 203: 768, 1088, or 1568 bytes).
+func ValidateMLKEMCiphertextLength(ciphertext []byte) error {
+	switch len(ciphertext) {
+	case MLKEM512CiphertextSize, MLKEM768CiphertextSize, MLKEM1024CiphertextSize:
+		return nil
+	default:
+		return fmt.Errorf("invalid ML-KEM ciphertext length: %d bytes (expected %d, %d, or %d)",
+			len(ciphertext), MLKEM512CiphertextSize, MLKEM768CiphertextSize, MLKEM1024CiphertextSize)
 	}
-	pin := strings.TrimRight(string(pinBytes), "\r\n")
+}
+
+func (c *Client) Decapsulate(tokenLabel, objectLabel, pinFilePath string, ciphertext []byte) ([]byte, error) {
+	if err := ValidateMLKEMCiphertextLength(ciphertext); err != nil {
+		return nil, err
+	}
+
+	pin, err := ReadPINFile(pinFilePath)
+	if err != nil {
+		return nil, err
+	}
 
 	slotID, err := c.FindSlotByTokenLabel(tokenLabel)
 	if err != nil {
@@ -407,44 +603,33 @@ func (c *Client) Decapsulate(tokenLabel, objectLabel, pinFilePath string, cipher
 	}
 	defer c.ctx.Logout(session)
 
-	template := []*pkcs11.Attribute{
-		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PRIVATE_KEY),
-		pkcs11.NewAttribute(pkcs11.CKA_LABEL, objectLabel),
-	}
-
-	if err := c.ctx.FindObjectsInit(session, template); err != nil {
-		return nil, fmt.Errorf("C_FindObjectsInit failed: %w", err)
-	}
-
-	objs, _, err := c.ctx.FindObjects(session, 1)
+	privHandle, err := c.findUniqueMLKEMKey(session, pkcs11.CKO_PRIVATE_KEY, objectLabel, tokenLabel)
 	if err != nil {
-		_ = c.ctx.FindObjectsFinal(session)
-		return nil, fmt.Errorf("C_FindObjects failed: %w", err)
+		return nil, err
 	}
-	_ = c.ctx.FindObjectsFinal(session)
-
-	if len(objs) == 0 {
-		return nil, fmt.Errorf("private key '%s' not found on token '%s'", objectLabel, tokenLabel)
-	}
-	privHandle := objs[0]
 	privUniqueID := c.GetUniqueID(session, privHandle)
 	fmt.Printf("[*] Located private key object handle: %d (0x%X, CKA_UNIQUE_ID: %s)\n", privHandle, privHandle, privUniqueID)
 
+	// The caller owns the returned secret and should clear() it after use.
+	sharedSecret, err := c.decapsulateWith(session, privHandle, ciphertext)
+	if err != nil {
+		return nil, err
+	}
+
+	fmt.Printf("[+] HSM Decapsulation completed natively on server!\n")
+	return sharedSecret, nil
+}
+
+// decapsulateWith runs C_DecapsulateKey with privHandle in a logged-in session and
+// returns the shared secret, destroying the temporary derived key object.
+func (c *Client) decapsulateWith(session pkcs11.SessionHandle, privHandle pkcs11.ObjectHandle, ciphertext []byte) ([]byte, error) {
 	derivedKeyHandle, err := c.v3.DecapsulateKey(uint(session), CKM_ML_KEM, uint(privHandle), ciphertext)
 	if err != nil {
 		return nil, fmt.Errorf("HSM C_DecapsulateKey failed: %w", err)
 	}
 	defer c.ctx.DestroyObject(session, pkcs11.ObjectHandle(derivedKeyHandle))
 
-	valAttrs, err := c.ctx.GetAttributeValue(session, pkcs11.ObjectHandle(derivedKeyHandle), []*pkcs11.Attribute{
-		pkcs11.NewAttribute(pkcs11.CKA_VALUE, nil),
-	})
-	if err != nil || len(valAttrs) == 0 || len(valAttrs[0].Value) == 0 {
-		return nil, fmt.Errorf("failed to read derived shared secret CKA_VALUE: %w", err)
-	}
-
-	fmt.Printf("[+] HSM Decapsulation completed natively on server!\n")
-	return valAttrs[0].Value, nil
+	return c.readValue(session, pkcs11.ObjectHandle(derivedKeyHandle), "derived shared secret")
 }
 
 func EncapsulateFromRawKey(rawKey []byte) (ciphertext []byte, sharedSecret []byte, algName string, err error) {
@@ -472,23 +657,125 @@ func EncapsulateFromRawKey(rawKey []byte) (ciphertext []byte, sharedSecret []byt
 	}
 }
 
+// EncapsulateFromPEM reads and validates an ML-KEM SPKI PEM file, then
+// encapsulates against it. It does not check where the key came from: callers
+// that need that should use ReadPublicKeyPEM and CheckPublicKeyFingerprint.
 func EncapsulateFromPEM(pemPath string) (ciphertext []byte, sharedSecret []byte, algName string, err error) {
+	rawKey, err := ReadPublicKeyPEM(pemPath)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return EncapsulateFromRawKey(rawKey)
+}
+
+// ReadPublicKeyPEM reads an ML-KEM SubjectPublicKeyInfo PEM file and returns the
+// raw encapsulation key after strict structural checks (no trailing DER, absent
+// parameters, whole-byte BIT STRING, OID matching the key length).
+func ReadPublicKeyPEM(pemPath string) ([]byte, error) {
 	pemData, err := os.ReadFile(pemPath)
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("failed to read public key PEM file '%s': %w", pemPath, err)
+		return nil, fmt.Errorf("failed to read public key PEM file '%s': %w", pemPath, err)
 	}
 
 	block, _ := pem.Decode(pemData)
 	if block == nil || block.Type != "PUBLIC KEY" {
-		return nil, nil, "", fmt.Errorf("invalid PEM file: missing 'PUBLIC KEY' block")
+		return nil, fmt.Errorf("invalid PEM file: missing 'PUBLIC KEY' block")
 	}
 
 	var spki SubjectPublicKeyInfo
-	if _, err := asn1.Unmarshal(block.Bytes, &spki); err != nil {
-		return nil, nil, "", fmt.Errorf("failed to unmarshal SubjectPublicKeyInfo: %w", err)
+	rest, err := asn1.Unmarshal(block.Bytes, &spki)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal SubjectPublicKeyInfo: %w", err)
+	}
+	if len(rest) != 0 {
+		return nil, fmt.Errorf("invalid SubjectPublicKeyInfo: %d trailing bytes after DER structure", len(rest))
+	}
+	if len(spki.Algorithm.Parameters.FullBytes) != 0 {
+		return nil, fmt.Errorf("invalid ML-KEM AlgorithmIdentifier: parameters must be absent")
 	}
 
-	return EncapsulateFromRawKey(spki.PublicKey.Bytes)
+	rawKey := spki.PublicKey.Bytes
+	if spki.PublicKey.BitLength != len(rawKey)*8 {
+		return nil, fmt.Errorf("invalid public key BIT STRING: %d bits is not a whole number of bytes", spki.PublicKey.BitLength)
+	}
+
+	wantOID, name, ok := mlkemOIDForKeyLength(len(rawKey))
+	if !ok {
+		return nil, fmt.Errorf("unexpected public key length: %d bytes", len(rawKey))
+	}
+	if !spki.Algorithm.Algorithm.Equal(wantOID) {
+		return nil, fmt.Errorf("algorithm OID %s does not match %d-byte %s key (expected %s)",
+			spki.Algorithm.Algorithm, len(rawKey), name, wantOID)
+	}
+
+	return rawKey, nil
+}
+
+// FingerprintPrefix labels fingerprints printed by the CLI; it is optional on input.
+const FingerprintPrefix = "SHA256:"
+
+// PublicKeyFingerprint returns "SHA256:" followed by the lowercase hex SHA-256 of
+// the key's canonical DER SubjectPublicKeyInfo. Hashing the canonical encoding
+// (rather than the file bytes) makes the HSM key and its PEM export produce the
+// same value, equal to:
+//
+//	openssl pkey -pubin -in key.pem -outform DER | openssl dgst -sha256
+func PublicKeyFingerprint(rawKey []byte) (string, error) {
+	der, _, err := marshalSPKI(rawKey)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(der)
+	return FingerprintPrefix + hex.EncodeToString(sum[:]), nil
+}
+
+// ParseFingerprint accepts a SHA-256 fingerprint as 64 hex digits, optionally
+// prefixed with "SHA256:" (any case) and/or separated by colons, and returns the
+// 32-byte digest.
+func ParseFingerprint(s string) ([]byte, error) {
+	v := strings.TrimSpace(s)
+	if len(v) >= len(FingerprintPrefix) && strings.EqualFold(v[:len(FingerprintPrefix)], FingerprintPrefix) {
+		v = v[len(FingerprintPrefix):]
+	}
+	v = strings.ReplaceAll(v, ":", "")
+	digest, err := hex.DecodeString(v)
+	if err != nil || len(digest) != sha256.Size {
+		return nil, fmt.Errorf("invalid fingerprint %q: expected %d hex digits (optionally prefixed %q)", s, 2*sha256.Size, FingerprintPrefix)
+	}
+	return digest, nil
+}
+
+// CheckPublicKeyFingerprint returns the key's fingerprint, and an error if it
+// differs from want (see ParseFingerprint for accepted forms).
+func CheckPublicKeyFingerprint(rawKey []byte, want string) (string, error) {
+	wantDigest, err := ParseFingerprint(want)
+	if err != nil {
+		return "", err
+	}
+	got, err := PublicKeyFingerprint(rawKey)
+	if err != nil {
+		return "", err
+	}
+	gotDigest, _ := ParseFingerprint(got)
+	if !bytes.Equal(gotDigest, wantDigest) {
+		return got, fmt.Errorf("public key fingerprint mismatch: got %s, expected %s%s",
+			got, FingerprintPrefix, hex.EncodeToString(wantDigest))
+	}
+	return got, nil
+}
+
+// mlkemOIDForKeyLength maps an ML-KEM encapsulation key length to its NIST OID and name.
+func mlkemOIDForKeyLength(n int) (asn1.ObjectIdentifier, string, bool) {
+	switch n {
+	case 800:
+		return OIDMLKEM512, "ML-KEM-512", true
+	case 1184:
+		return OIDMLKEM768, "ML-KEM-768", true
+	case 1568:
+		return OIDMLKEM1024, "ML-KEM-1024", true
+	default:
+		return nil, "", false
+	}
 }
 
 func ParseMLKEMAlgorithm(alg string) (uint, error) {
@@ -504,21 +791,10 @@ func ParseMLKEMAlgorithm(alg string) (uint, error) {
 	}
 }
 
-func EncodeRawPublicKeyToPEM(rawKey []byte) ([]byte, string, error) {
-	var algOID asn1.ObjectIdentifier
-	var algName string
-
-	switch len(rawKey) {
-	case 800:
-		algOID = OIDMLKEM512
-		algName = "ML-KEM-512"
-	case 1184:
-		algOID = OIDMLKEM768
-		algName = "ML-KEM-768"
-	case 1568:
-		algOID = OIDMLKEM1024
-		algName = "ML-KEM-1024"
-	default:
+// marshalSPKI wraps a raw ML-KEM encapsulation key in a DER SubjectPublicKeyInfo.
+func marshalSPKI(rawKey []byte) ([]byte, string, error) {
+	algOID, algName, ok := mlkemOIDForKeyLength(len(rawKey))
+	if !ok {
 		return nil, "", fmt.Errorf("unexpected public key length: %d bytes (expected 800, 1184, or 1568)", len(rawKey))
 	}
 
@@ -535,6 +811,14 @@ func EncodeRawPublicKeyToPEM(rawKey []byte) ([]byte, string, error) {
 	derBytes, err := asn1.Marshal(spki)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to marshal ASN.1 SubjectPublicKeyInfo: %w", err)
+	}
+	return derBytes, algName, nil
+}
+
+func EncodeRawPublicKeyToPEM(rawKey []byte) ([]byte, string, error) {
+	derBytes, algName, err := marshalSPKI(rawKey)
+	if err != nil {
+		return nil, "", err
 	}
 
 	pemBlock := &pem.Block{

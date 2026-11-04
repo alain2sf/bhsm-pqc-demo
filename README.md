@@ -28,10 +28,13 @@ Key PKCS#11 concepts used in this project:
 ### Hybrid Cryptography: Key Derivation (HKDF) & AES-256-GCM AEAD
 Once the 32-byte shared secret is established between sender and receiver via ML-KEM:
 1. **HKDF-SHA256 (RFC 5869):** Derives a cryptographically strong 32-byte (256-bit) AES key using a domain-separation salt (`bhsm-demo-hkdf-salt-v1`) and context info (`bhsm-demo aes-256-gcm v1`).
-2. **AES-256-GCM AEAD (NIST SP 800-38D):** Authenticated encryption mode that produces:
+2. **AES-256-GCM AEAD (NIST SP 800-38D):** Authenticated encryption mode. The encrypted file (format v1) is laid out as:
+   * **5-byte header** `BHSM` + version byte `0x01`
    * **12-byte random Nonce (IV)**
    * **Ciphertext**
    * **16-byte Authentication Tag (GHASH)** preventing any tampering or bit-flipping attacks.
+
+   The GCM additional authenticated data (AAD) is `header || SHA-256(KEM ciphertext)`. The header can't be altered, and a payload decrypts only together with the ML-KEM ciphertext (`ciphertext.bin`) whose shared secret produced its key.
 
 ---
 
@@ -112,7 +115,9 @@ See “BouncyHSM & OpenSSL Runbook (Demo Prototype) v1.0” [`BouncyHSM-OpenSSL-
 4. **PIN File**: Create a plain text file containing your HSM token User PIN:
    ```bash
    echo -n "123456" > ./DemoSlotToken1.pin
+   chmod 600 ./DemoSlotToken1.pin
    ```
+   The tool refuses a PIN file that group or others can read or write.
 
 ---
 
@@ -126,6 +131,7 @@ See “BouncyHSM & OpenSSL Runbook (Demo Prototype) v1.0” [`BouncyHSM-OpenSSL-
 | `HSM_OBJECT_LABEL` | Identifier attached to the public/private key pair | `mlkem768-demo` |
 | `HSM_PIN_FILE` | Path to the file storing the User PIN | `./DemoSlotToken1.pin` |
 | `PUBKEY_FILE` | Path to the exported public key PEM file | `./mlkem768_pub.pem` |
+| `PUBKEY_FINGERPRINT` | Expected public key fingerprint for `encap-pem` (empty: not pinned, warn only) | *(empty)* |
 | `CIPHERTEXT_FILE` | Path for KEM ciphertext file | `./ciphertext.bin` |
 | `SENDER_SECRET` | Path for sender's shared secret | `./sender_secret.bin` |
 | `RECEIVER_SECRET` | Path for receiver's shared secret | `./receiver_secret.bin` |
@@ -157,7 +163,7 @@ make conn
 ---
 
 ### Step 2: Generate ML-KEM-768 Key Pair on HSM (`make keygen`)
-Authenticates to the HSM token using the provided PIN file. Removes any existing keys matching `mlkem768-demo` (logging their `CKA_UNIQUE_ID`), generates a new persistent key pair, and logs the new `CKA_UNIQUE_ID` values:
+Authenticates to the HSM token using the provided PIN file, generates a new persistent key pair (private key non-extractable, both halves sharing a random `CKA_ID`), then removes the previous keys labelled `mlkem768-demo` (logging their `CKA_UNIQUE_ID`) and logs the new `CKA_UNIQUE_ID` values. Because generation happens first, a failed generation leaves the existing key pair intact:
 
 ```bash
 make keygen
@@ -173,11 +179,16 @@ openssl genpkey -provider pkcs11prov -provider default -algorithm ML-KEM-768 \
 ---
 
 ### Step 3: Extract Public Key to PEM (`make extract-pk`)
-Opens a public (unauthenticated i.e. no PIN required) session to the HSM, locates the public key object, extracts the raw 1184-byte key material, formats it into an ASN.1 `SubjectPublicKeyInfo` container (using NIST OID `2.16.840.1.101.3.4.4.2`), and saves it to a standard PEM file:
+Opens a session to the HSM (logged in when `HSM_PIN_FILE` is set, for the pairing check below), locates the unique ML-KEM public key object with the label (several matches are refused), extracts the raw 1184-byte key material, formats it into an ASN.1 `SubjectPublicKeyInfo` container (using NIST OID `2.16.840.1.101.3.4.4.2`), and saves it to a standard PEM file. It also prints the key's **SHA-256 fingerprint** (the SHA-256 of the DER `SubjectPublicKeyInfo`), and recomputes it with OpenSSL as a cross-check:
 
 ```bash
 make extract-pk
+# [*] Fingerprint  : SHA256:e88dec6e...532a1f91
 ```
+
+When `HSM_PIN_FILE` is set (the Makefile always sets it), `-p` and `-e` log in and prove that the public key belongs to the private key with the same label before using it. They check that both halves carry the same `CKA_ID`, then encapsulate locally to the public key and decapsulate on the HSM, and require the two shared secrets to match. The public object can be replaced without the PIN, and `CKA_ID` can be copied, so only the round trip proves the pairing. Without a PIN file, the pairing isn't checked and a warning is printed.
+
+The PEM file carries no proof of origin: anyone who can replace it in transit can make the sender encrypt to their own key. Hand the fingerprint to the sender over a channel you trust, so they can pin it in Step 4.
 
 #### Equivalent OpenSSL Command:
 ```bash
@@ -197,7 +208,18 @@ make encap-hsm
 
 # Or offline using the exported PEM file and encapsulate:
 make encap-pem
+
+# Same, but refuse the PEM unless it matches the fingerprint printed by extract-pk:
+make encap-pem PUBKEY_FINGERPRINT=SHA256:e88dec6e...532a1f91
 ```
+
+Without a pinned fingerprint, `-e -in` prints the key's fingerprint and a warning. With `-fingerprint` (or `HSM_PUBKEY_FINGERPRINT`), a mismatch aborts before any ciphertext or secret is written. The accepted forms are 64 hex digits, optionally prefixed `SHA256:` and/or separated by colons. To compute the fingerprint independently:
+
+```bash
+openssl pkey -pubin -in mlkem768_pub.pem -outform DER | openssl dgst -sha256
+```
+
+A PEM file must be a well-formed ML-KEM `SubjectPublicKeyInfo`: the OID must match the key length, there must be no algorithm parameters and no trailing data, and the BIT STRING must be a whole number of bytes. Otherwise it is rejected. The shared secret is written with mode `0600`. The CLI refuses to overwrite an existing secret file, so the Makefile targets delete old outputs first.
 
 #### Equivalent OpenSSL Command:
 ```bash
@@ -210,7 +232,7 @@ openssl pkeyutl -encap \
 ---
 
 ### Step 5: Decapsulate Shared Secret on HSM (`make decap`)
-Authenticates to the HSM token using the PIN file, locates the private key object handle, and executes native decapsulation on the HSM server using the PKCS#11 v3.2 function **`C_DecapsulateKey`** via `internal/pkcs11v3`, recovering `receiver_secret.bin` (32 bytes):
+Authenticates to the HSM token using the PIN file, locates the private key object handle, and executes native decapsulation on the HSM server using the PKCS#11 v3.2 function **`C_DecapsulateKey`** via `internal/pkcs11v3`, recovering `receiver_secret.bin` (32 bytes, mode `0600`, never overwritten). Exactly one ML-KEM private key must carry the label. A ciphertext whose length matches no ML-KEM parameter set (768, 1088 or 1568 bytes) is rejected before it reaches the HSM:
 
 ```bash
 make decap
@@ -234,10 +256,12 @@ make verify
 make show-secrets
 ```
 
+`show-secrets` prints the raw shared secrets behind a warning banner. It is for local inspection only, is not part of `make demo`, and must never run in CI or anywhere its output is logged.
+
 ---
 
 ### Step 7: Encrypt Payload with Derived AES-256-GCM Key (`make sym-enc`)
-Derives the 32-byte AES key from `sender_secret.bin` using HKDF-SHA256 and encrypts `msg.txt` into `msg.enc`:
+Derives the 32-byte AES key from `sender_secret.bin` using HKDF-SHA256 and encrypts `msg.txt` into `msg.enc`, binding the payload to `ciphertext.bin` through the AAD. The Makefile creates the sample `msg.txt` with owner-only permissions. Neither the AES key nor the plaintext is printed:
 ```bash
 make sym-enc
 ```
@@ -245,7 +269,7 @@ make sym-enc
 ---
 
 ### Step 8: Decrypt Payload with Recovered AES-256-GCM Key (`make sym-dec`)
-Derives the 32-byte AES key from `receiver_secret.bin` using HKDF-SHA256, verifies the GCM authentication tag, and decrypts `msg.enc` into `msg.dec`:
+Derives the 32-byte AES key from `receiver_secret.bin` using HKDF-SHA256, verifies the GCM authentication tag (which also covers the header and `ciphertext.bin`), and decrypts `msg.enc` into `msg.dec` (mode `0600`, never overwritten):
 ```bash
 make sym-dec
 ```
@@ -270,11 +294,13 @@ make demo
 
 Run unit tests across all subpackages (`cmd`, `internal/hsm`, `internal/pkcs11v3`, and `internal/sym`).
 
-Unit tests validate CLI flags, algorithm parsing, error branches, ASN.1 / X.509 `SubjectPublicKeyInfo` encoding, encapsulation round-trips, and the isolated PKCS#11 v3.2 driver:
+Unit tests validate CLI flags, algorithm parsing, error branches, ASN.1 / X.509 `SubjectPublicKeyInfo` encoding, encapsulation round-trips, fingerprint pinning, AES-GCM format and KEM-ciphertext binding, secret file permissions, and the isolated PKCS#11 v3.2 driver:
 
 ```bash
 make test
 ```
+
+Tests that need the HSM skip themselves when it isn't configured or can't be reached, so a plain `go test ./...` passes offline. `make test` exports `PKCS11_LIB_PATH` and `BOUNCY_HSM_CFG_STRING`, plus `HSM_TOKEN_LABEL`, `HSM_OBJECT_LABEL` and `HSM_PIN_FILE` (made absolute). With these, `TestLiveKeyPairVerification` logs in and checks the demo key pair on the live HSM. It is read-only: the temporary decapsulated key is destroyed.
 
 ---
 
@@ -299,12 +325,13 @@ Actions (mutually exclusive - pick exactly one):
 Options:
   -in <path>              Input file path
   -out <path>             Output file path for symmetric payload
-  -cipher <path>          KEM ciphertext file path (default: ./ciphertext.bin)
+  -cipher <path>          KEM ciphertext file (-e output; -d/-sym-enc/-sym-dec input; default: ./ciphertext.bin)
   -secret <path>          Shared secret file path
   -salt <string>          HKDF salt
   -info <string>          HKDF domain separation context
   -o <path>               Output file path for public key (for -p)
-  -lib <path>             Path to PKCS#11 dynamic library
+  -lib <path>             Absolute path to PKCS#11 dynamic library (or PKCS11_LIB_PATH)
+  -fingerprint <sha256>   Expected public key fingerprint for -e (as printed by -p; or HSM_PUBKEY_FINGERPRINT)
 
   Environment Variables:
   BOUNCY_HSM_CFG_STRING   HSM server configuration string
@@ -313,6 +340,7 @@ Options:
   HSM_OBJECT_LABEL        Object/key label
   HSM_PIN_FILE            Path to token PIN file (for -g and -d)
   HSM_PUBKEY_FILE         Fallback input public key PEM file (for -e)
+  HSM_PUBKEY_FINGERPRINT  Fallback expected public key fingerprint (for -e)
   HSM_CIPHER_FILE         Fallback ciphertext file path
   HSM_SECRET_FILE         Fallback shared secret file path
 ```

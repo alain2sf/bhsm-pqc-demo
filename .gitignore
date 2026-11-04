@@ -15,6 +15,19 @@
 DemoSlotToken1.pin
 
 # -----------------------------------------------------------------------------
+# Demo workflow artefacts (written to the repo root by the Makefile targets)
+# sender/receiver secrets are raw ML-KEM shared secrets and msg.dec is
+# decrypted plaintext: never commit these.
+# -----------------------------------------------------------------------------
+/mlkem768_pub.pem
+/ciphertext.bin
+/sender_secret.bin
+/receiver_secret.bin
+/msg.txt
+/msg.enc
+/msg.dec
+
+# -----------------------------------------------------------------------------
 # Build artefacts
 # -----------------------------------------------------------------------------
 dist/

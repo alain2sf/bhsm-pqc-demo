@@ -359,3 +359,150 @@ func TestLiveClientMethods(t *testing.T) {
 		t.Errorf("Expected error when searching for non-existent token, got nil")
 	}
 }
+
+// TestValidateMLKEMCiphertextLength accepts only FIPS 203 ciphertext sizes.
+func TestValidateMLKEMCiphertextLength(t *testing.T) {
+	for _, n := range []int{768, 1088, 1568} {
+		if err := hsm.ValidateMLKEMCiphertextLength(make([]byte, n)); err != nil {
+			t.Errorf("expected %d-byte ciphertext to be valid, got: %v", n, err)
+		}
+	}
+	for _, n := range []int{0, 1, 767, 1087, 1089, 2048} {
+		if err := hsm.ValidateMLKEMCiphertextLength(make([]byte, n)); err == nil {
+			t.Errorf("expected %d-byte ciphertext to be rejected, got nil", n)
+		}
+	}
+}
+
+// writePEMForSPKI DER-encodes an SPKI (plus optional trailing bytes) into a temp PEM file.
+func writePEMForSPKI(t *testing.T, spki hsm.SubjectPublicKeyInfo, trailing []byte) string {
+	t.Helper()
+	der, err := asn1.Marshal(spki)
+	if err != nil {
+		t.Fatalf("marshal SPKI: %v", err)
+	}
+	der = append(der, trailing...)
+	path := filepath.Join(t.TempDir(), "key.pem")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestEncapsulateFromPEM_RejectsMalformedSPKI covers OID/length mismatch,
+// trailing DER bytes, unexpected parameters, and partial-byte BIT STRINGs.
+func TestEncapsulateFromPEM_RejectsMalformedSPKI(t *testing.T) {
+	dk, err := mlkem.GenerateKey768()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := dk.EncapsulationKey().Bytes()
+	good := hsm.SubjectPublicKeyInfo{
+		Algorithm: hsm.AlgorithmIdentifier{Algorithm: hsm.OIDMLKEM768},
+		PublicKey: asn1.BitString{Bytes: raw, BitLength: len(raw) * 8},
+	}
+
+	if _, _, _, err := hsm.EncapsulateFromPEM(writePEMForSPKI(t, good, nil)); err != nil {
+		t.Fatalf("well-formed SPKI rejected: %v", err)
+	}
+
+	wrongOID := good
+	wrongOID.Algorithm.Algorithm = hsm.OIDMLKEM1024
+
+	withParams := good
+	withParams.Algorithm.Parameters = asn1.NullRawValue
+
+	partialBits := good
+	partialBits.PublicKey.BitLength = len(raw)*8 - 1
+
+	cases := []struct {
+		name     string
+		spki     hsm.SubjectPublicKeyInfo
+		trailing []byte
+	}{
+		{"OID does not match key length", wrongOID, nil},
+		{"trailing DER bytes", good, []byte{0x00, 0x01}},
+		{"AlgorithmIdentifier parameters present", withParams, nil},
+		{"BIT STRING not whole bytes", partialBits, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, _, err := hsm.EncapsulateFromPEM(writePEMForSPKI(t, tc.spki, tc.trailing)); err == nil {
+				t.Errorf("expected rejection, got nil error")
+			}
+		})
+	}
+}
+
+// TestReadPINFile enforces owner-only permissions and trims trailing newlines.
+func TestReadPINFile(t *testing.T) {
+	dir := t.TempDir()
+
+	ok := filepath.Join(dir, "ok.pin")
+	if err := os.WriteFile(ok, []byte("123456\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pin, err := hsm.ReadPINFile(ok)
+	if err != nil {
+		t.Fatalf("0600 PIN file rejected: %v", err)
+	}
+	if pin != "123456" {
+		t.Errorf("PIN = %q, want %q", pin, "123456")
+	}
+
+	for _, mode := range []os.FileMode{0o640, 0o604, 0o644} {
+		p := filepath.Join(dir, "loose.pin")
+		if err := os.WriteFile(p, []byte("123456"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, mode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := hsm.ReadPINFile(p); err == nil {
+			t.Errorf("expected PIN file with mode %04o to be rejected", mode)
+		}
+		os.Remove(p)
+	}
+
+	empty := filepath.Join(dir, "empty.pin")
+	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hsm.ReadPINFile(empty); err == nil {
+		t.Errorf("expected empty PIN file to be rejected")
+	}
+}
+
+// TestLiveKeyPairVerification fetches the demo public key with the PIN, which
+// proves on the HSM that it pairs with the private key of the same label.
+func TestLiveKeyPairVerification(t *testing.T) {
+	libPath := os.Getenv("PKCS11_LIB_PATH")
+	token, label, pinFile := os.Getenv("HSM_TOKEN_LABEL"), os.Getenv("HSM_OBJECT_LABEL"), os.Getenv("HSM_PIN_FILE")
+	if libPath == "" || os.Getenv("BOUNCY_HSM_CFG_STRING") == "" || token == "" || label == "" || pinFile == "" {
+		t.Skip("PKCS11_LIB_PATH, BOUNCY_HSM_CFG_STRING, HSM_TOKEN_LABEL, HSM_OBJECT_LABEL and HSM_PIN_FILE are required; skipping")
+	}
+	if _, err := os.Stat(libPath); err != nil {
+		t.Skipf("library not available (%v); skipping", err)
+	}
+	if _, err := os.Stat(pinFile); err != nil {
+		t.Skipf("PIN file not available (%v); skipping", err)
+	}
+
+	client, err := hsm.NewClient(libPath)
+	if err != nil {
+		t.Skipf("could not connect to live HSM (%v); skipping", err)
+	}
+	defer client.Close()
+
+	if _, err := client.FindSlotByTokenLabel(token); err != nil {
+		t.Skipf("token %q not present (%v); skipping", token, err)
+	}
+
+	raw, err := client.FetchRawPublicKey(token, label, pinFile)
+	if err != nil {
+		t.Fatalf("FetchRawPublicKey with pairing check failed: %v", err)
+	}
+	if n := len(raw); n != 800 && n != 1184 && n != 1568 {
+		t.Fatalf("unexpected key length %d", n)
+	}
+}

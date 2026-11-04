@@ -3,10 +3,12 @@ BINARY_NAME=bhsm-pqc-demo
 BUILD_DIR=bin
 CMD_PATH=./cmd/bhsm-pqc-demo
 
-REQUIRED_GO_VERSION=go1.27.1
+# Minimum Go toolchain (any newer release is accepted)
+MIN_GO_VERSION=go1.27.1
 
 export GO111MODULE=on
-export GOTOOLCHAIN=auto
+# Use the installed toolchain only: never download one on go.mod's request.
+export GOTOOLCHAIN=local
 
 # ============================================================================
 # HSM Connection Parameters
@@ -23,6 +25,9 @@ ALGORITHM         ?= ML-KEM-768
 
 # Artifact Paths
 PUBKEY_FILE       ?= ./mlkem768_pub.pem
+# Expected SHA-256 fingerprint of PUBKEY_FILE (as printed by 'make extract-pk'),
+# obtained over a channel you trust; 'encap-pem' refuses a key that differs.
+PUBKEY_FINGERPRINT ?=
 CIPHERTEXT_FILE   ?= ./ciphertext.bin
 SENDER_SECRET     ?= ./sender_secret.bin
 RECEIVER_SECRET   ?= ./receiver_secret.bin
@@ -56,13 +61,21 @@ all: build
 # Build and Dependency Targets
 # ----------------------------------------------------------------------------
 
+# Numeric major.minor.patch comparison: passes when the installed Go >= MIN_GO_VERSION.
+# ("go1.28rc1" compares as 1.28.0 because awk reads the leading digits of "28rc1".)
 check-go-version:
-	@GO_VER=$$(go version | awk '{print $$3}'); \
-	if [ "$$GO_VER" != "$(REQUIRED_GO_VERSION)" ]; then \
-		echo "[-] Error: Go version mismatch. Required: $(REQUIRED_GO_VERSION), Found: $$GO_VER"; \
-		exit 1; \
+	@GO_VER=$$(go env GOVERSION); \
+	if awk -v have="$${GO_VER#go}" -v want="$(MIN_GO_VERSION:go%=%)" 'BEGIN { \
+			split(have, h, "."); split(want, w, "."); \
+			for (i = 1; i <= 3; i++) { \
+				if (h[i] + 0 > w[i] + 0) exit 0; \
+				if (h[i] + 0 < w[i] + 0) exit 1; \
+			} \
+			exit 0 }'; then \
+		echo "[✓] Go version requirement met: $$GO_VER (minimum $(MIN_GO_VERSION))"; \
 	else \
-		echo "[✓] Go version requirement met: $$GO_VER"; \
+		echo "[-] Error: Go version too old. Minimum: $(MIN_GO_VERSION), Found: $$GO_VER"; \
+		exit 1; \
 	fi
 
 deps: check-go-version
@@ -86,7 +99,9 @@ test: LIB_PATH := $(LIB_PATH)
 test: deps
 	@echo "[*] Running with PKCS11_LIB_PATH='$(LIB_PATH)'"
 	@echo "[*] Running with BOUNCY_HSM_CFG_STRING='$(CFG_STRING)'"
-	@BOUNCY_HSM_CFG_STRING="$(CFG_STRING)" PKCS11_LIB_PATH="$(LIB_PATH)" go test -v ./...
+	@BOUNCY_HSM_CFG_STRING="$(CFG_STRING)" PKCS11_LIB_PATH="$(LIB_PATH)" \
+	 HSM_TOKEN_LABEL="$(HSM_TOKEN_LABEL)" HSM_OBJECT_LABEL="$(HSM_OBJECT_LABEL)" \
+	 HSM_PIN_FILE="$(abspath $(HSM_PIN_FILE))" go test -v ./...
 
 # ----------------------------------------------------------------------------
 # ML-KEM Workflow Targets
@@ -109,6 +124,8 @@ extract-pk: build
 	@$(EXEC_HSM) -p -o $(PUBKEY_FILE)
 	@echo -e "\n[*] Verifying PEM Structure with OpenSSL:"
 	@openssl pkey -pubin -in $(PUBKEY_FILE) -text -noout
+	@echo -e "\n[*] OpenSSL SHA-256 of SPKI DER (must equal the fingerprint above):"
+	@openssl pkey -pubin -in $(PUBKEY_FILE) -outform DER | openssl dgst -sha256 -r | cut -d' ' -f1
 
 # 4. Encapsulation via direct HSM public key lookup (No PEM needed)
 encap-hsm: build
@@ -122,7 +139,8 @@ encap-pem: build
 	@rm -f $(CIPHERTEXT_FILE) $(SENDER_SECRET)
 	@HSM_CIPHER_FILE="$(CIPHERTEXT_FILE)" \
 	 HSM_SECRET_FILE="$(SENDER_SECRET)" \
-	 ./$(BUILD_DIR)/$(BINARY_NAME) -e -in $(PUBKEY_FILE)
+	 ./$(BUILD_DIR)/$(BINARY_NAME) -e -in $(PUBKEY_FILE) \
+	   $(if $(PUBKEY_FINGERPRINT),-fingerprint $(PUBKEY_FINGERPRINT))
 
 # 5. Decapsulation on HSM using the private key
 decap: build
@@ -141,7 +159,10 @@ verify:
 # Display the Shared Secret Files: Sender (encap) & Receiver (decap)
 # ----------------------------------------------------------------------------
 
+# WARNING: prints raw key material. For local demo inspection only; deliberately
+# not part of 'demo', and must never run in CI or anywhere output is logged.
 show-secrets:
+	@echo -e "\033[0;33m[!] WARNING: printing raw shared-secret key material (demo use only; do not log or share)\033[0m"
 	@echo -e "\n--- Sender Shared Secret ---"
 	@pr -m -t -w 130 \
 	  <(xxd -g 1 $(SENDER_SECRET)) \
@@ -160,10 +181,11 @@ sym-enc: build
 	@echo -e "\n=== [7/8] Encrypting Payload (HKDF + AES-256-GCM Sender) ==="
 	@rm -f $(ENC_MSG_FILE)
 	@if [ ! -f $(PLAIN_MSG_FILE) ]; then \
-		echo -n "hello from the AES-256-GCM AEAD prototype using ML-KEM-768 key exchange" > $(PLAIN_MSG_FILE); \
+		(umask 077; echo -n "hello from the AES-256-GCM AEAD prototype using ML-KEM-768 key exchange" > $(PLAIN_MSG_FILE)); \
 	fi
 	@./$(BUILD_DIR)/$(BINARY_NAME) -sym-enc \
 	  -secret $(SENDER_SECRET) \
+	  -cipher $(CIPHERTEXT_FILE) \
 	  -in $(PLAIN_MSG_FILE) \
 	  -out $(ENC_MSG_FILE)
 
@@ -173,6 +195,7 @@ sym-dec: build
 	@rm -f $(DEC_MSG_FILE)
 	@./$(BUILD_DIR)/$(BINARY_NAME) -sym-dec \
 	  -secret $(RECEIVER_SECRET) \
+	  -cipher $(CIPHERTEXT_FILE) \
 	  -in $(ENC_MSG_FILE) \
 	  -out $(DEC_MSG_FILE)
 
