@@ -340,6 +340,18 @@ The current findings are all reviewed and accepted in the code with `// #nosec <
 
 Rules are always named in a `#nosec`, so other rules still apply to that line. `gosec -show-ignored ./...` lists the accepted findings, and `gosec -nosec ./...` ignores the comments to show the raw report. Extra flags go in `GOSEC_FLAGS` (e.g. `make gosec GOSEC_FLAGS=-severity=high`). It runs offline and is deliberately not part of `make build` or `make test`.
 
+### Other Checks
+
+```bash
+make fmt-check     # fail if any Go file is not gofmt-formatted (fix: gofmt -w .)
+make tidy-check    # go mod tidy -diff: fail if go.mod/go.sum are not tidy; changes nothing
+make verify-mods   # go mod verify: downloaded modules match go.sum
+make test-race     # make test with the race detector
+make help          # list all targets
+```
+
+`verify-mods` is not called `verify` because `make verify` is step 6, the KEM shared-secret check.
+
 ---
 
 ## 8. CLI Reference & Help Screen

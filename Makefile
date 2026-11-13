@@ -43,6 +43,11 @@ ARGS ?= -c
 # Bouncy HSM Configuration String (LogLevel: NONE, INFO, ERROR, SEVERE, FATAL)
 CFG_STRING = Server=$(HSM_HOST); Port=$(HSM_PORT); LogTarget=Console; LogLevel=NONE;
 
+# Environment for 'make test' and 'make test-race' (live tests skip without an HSM)
+TEST_ENV = BOUNCY_HSM_CFG_STRING="$(CFG_STRING)" PKCS11_LIB_PATH="$(LIB_PATH)" \
+           HSM_TOKEN_LABEL="$(HSM_TOKEN_LABEL)" HSM_OBJECT_LABEL="$(HSM_OBJECT_LABEL)" \
+           HSM_PIN_FILE="$(abspath $(HSM_PIN_FILE))"
+
 # Extra gosec flags, e.g. GOSEC_FLAGS = -severity=medium
 # (prefer '// #nosec G304 -- reason' in code over excluding a rule globally)
 GOSEC_FLAGS =
@@ -55,10 +60,13 @@ EXEC_HSM = BOUNCY_HSM_CFG_STRING="$(CFG_STRING)" \
            HSM_PIN_FILE="$(HSM_PIN_FILE)" \
            ./$(BUILD_DIR)/$(BINARY_NAME)
 
-.PHONY: all check-go-version build run test vulncheck staticcheck gosec clean clean-artifacts show-secrets \
+.PHONY: all check-go-version deps tidy-check verify-mods build run test test-race \
+        fmt-check vulncheck staticcheck gosec help \
+        clean clean-artifacts clean-cache show-secrets \
         conn keygen extract-pk encap-hsm encap-pem decap verify \
         sym-enc sym-dec sym-verify demo
 
+## Default target: build
 all: build
 
 # ----------------------------------------------------------------------------
@@ -67,6 +75,7 @@ all: build
 
 # Numeric major.minor.patch comparison: passes when the installed Go >= MIN_GO_VERSION.
 # ("go1.28rc1" compares as 1.28.0 because awk reads the leading digits of "28rc1".)
+## Fail unless the installed Go is at least MIN_GO_VERSION
 check-go-version:
 	@GO_VER=$$(go env GOVERSION); \
 	if awk -v have="$${GO_VER#go}" -v want="$(MIN_GO_VERSION:go%=%)" 'BEGIN { \
@@ -82,9 +91,20 @@ check-go-version:
 		exit 1; \
 	fi
 
+## Sync go.mod and go.sum with the imports (go mod tidy)
 deps: check-go-version
 	go mod tidy
 
+## Fail if go.mod/go.sum are not tidy, printing the diff (changes nothing)
+tidy-check: check-go-version
+	go mod tidy -diff
+
+# Named verify-mods because 'verify' is the KEM shared-secret check (step 6).
+## Check that downloaded modules match go.sum (go mod verify)
+verify-mods: check-go-version
+	go mod verify
+
+## Tidy, vet, then build bin/bhsm-pqc-demo
 build: deps
 	@mkdir -p $(BUILD_DIR)
 	@# Verify and compile all packages across the repository
@@ -92,22 +112,38 @@ build: deps
 	@# Produce the final binary
 	go build -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_PATH)
 
-# Generic run target (accepts arbitrary ARGS)
+## Run the binary with the HSM env vars set (flags via ARGS="...")
 run: build
 	@echo "[*] Running with BOUNCY_HSM_CFG_STRING='$(CFG_STRING)'"
 	@echo "[*] Running with PKCS11_LIB_PATH='$(LIB_PATH)'"
 	@$(EXEC_HSM) $(ARGS)
 
-# Unit test suite
+## Run the unit tests with the HSM env vars set (live tests skip without an HSM)
 test: LIB_PATH := $(LIB_PATH)
 test: deps
 	@echo "[*] Running with PKCS11_LIB_PATH='$(LIB_PATH)'"
 	@echo "[*] Running with BOUNCY_HSM_CFG_STRING='$(CFG_STRING)'"
-	@BOUNCY_HSM_CFG_STRING="$(CFG_STRING)" PKCS11_LIB_PATH="$(LIB_PATH)" \
-	 HSM_TOKEN_LABEL="$(HSM_TOKEN_LABEL)" HSM_OBJECT_LABEL="$(HSM_OBJECT_LABEL)" \
-	 HSM_PIN_FILE="$(abspath $(HSM_PIN_FILE))" go test -v ./...
+	@$(TEST_ENV) go test -v ./...
+
+## Same as 'test', with the race detector
+test-race: LIB_PATH := $(LIB_PATH)
+test-race: deps
+	@echo "[*] Running with PKCS11_LIB_PATH='$(LIB_PATH)'"
+	@echo "[*] Running with BOUNCY_HSM_CFG_STRING='$(CFG_STRING)'"
+	@$(TEST_ENV) go test -race -v ./...
+
+## Fail if any Go file is not gofmt-formatted (fix with: gofmt -w .)
+fmt-check:
+	@files=$$(gofmt -l .); \
+	if [[ -n "$$files" ]]; then \
+		echo "[-] Not gofmt-formatted (fix with: gofmt -w .):"; \
+		echo "$$files"; \
+		exit 1; \
+	fi; \
+	echo "[✓] All Go files are gofmt-formatted"
 
 # Vulnerability scan (govulncheck is installed and updated separately, e.g. via go-global-update)
+## Scan code and dependencies for known vulnerabilities (needs network)
 vulncheck: check-go-version
 	@command -v govulncheck >/dev/null 2>&1 || { \
 		echo "[-] govulncheck not found. Install: go install golang.org/x/vuln/cmd/govulncheck@latest"; exit 1; }
@@ -115,6 +151,7 @@ vulncheck: check-go-version
 
 # Static analysis (staticcheck is installed and updated separately, e.g. via go-global-update).
 # It must be built with a Go release >= go.mod's; reinstall it after upgrading Go.
+## Run staticcheck
 staticcheck: check-go-version
 	@command -v staticcheck >/dev/null 2>&1 || { \
 		echo "[-] staticcheck not found. Install: go install honnef.co/go/tools/cmd/staticcheck@latest"; exit 1; }
@@ -123,6 +160,7 @@ staticcheck: check-go-version
 # Security scan (gosec is installed and updated separately, e.g. via go-global-update).
 # Accepted findings are marked in code with '// #nosec <rule> -- reason';
 # 'gosec -show-ignored ./...' lists them, 'gosec -nosec ./...' ignores the marks.
+## Scan the code for security problems (gosec, CWE-mapped rules)
 gosec: check-go-version
 	@command -v gosec >/dev/null 2>&1 || { \
 		echo "[-] gosec not found. Install: go install github.com/securego/gosec/v2/cmd/gosec@latest"; exit 1; }
@@ -132,17 +170,17 @@ gosec: check-go-version
 # ML-KEM Workflow Targets
 # ----------------------------------------------------------------------------
 
-# 1. Connection check and token enumeration
+## 1. Connection check and token enumeration
 conn: build
 	@echo -e "\n=== [1/8] Testing HSM Connection & Listing Slots ==="
 	@$(EXEC_HSM) -c
 
-# 2. Key pair generation (ML-KEM-768 on HSM)
+## 2. Key pair generation (ML-KEM-768 on HSM)
 keygen: build
 	@echo -e "\n=== [2/8] Generating $(ALGORITHM) Key Pair on HSM ==="
 	@$(EXEC_HSM) -g $(ALGORITHM)
 
-# 3. Extract public key to PEM and verify with OpenSSL
+## 3. Extract public key to PEM and verify with OpenSSL
 extract-pk: build
 	@echo -e "\n=== [3/8] Extracting Public Key to $(PUBKEY_FILE) ==="
 	@rm -f $(PUBKEY_FILE)
@@ -152,13 +190,13 @@ extract-pk: build
 	@echo -e "\n[*] OpenSSL SHA-256 of SPKI DER (must equal the fingerprint above):"
 	@openssl pkey -pubin -in $(PUBKEY_FILE) -outform DER | openssl dgst -sha256 -r | cut -d' ' -f1
 
-# 4. Encapsulation via direct HSM public key lookup (No PEM needed)
+## 4. Encapsulation via direct HSM public key lookup (No PEM needed)
 encap-hsm: build
 	@echo -e "\n=== [4/8] Encapsulating Shared Secret (Querying PK from HSM) ==="
 	@rm -f $(CIPHERTEXT_FILE) $(SENDER_SECRET)
 	@$(EXEC_HSM) -e -cipher $(CIPHERTEXT_FILE) -secret $(SENDER_SECRET)
 
-# 4b. Alternative: Encapsulation using the exported local PEM file (Offline sender)
+## 4b. Alternative: Encapsulation using the exported local PEM file (Offline sender)
 encap-pem: build
 	@echo -e "\n=== [4b/8] Encapsulating Shared Secret (Using Local PEM: $(PUBKEY_FILE)) ==="
 	@rm -f $(CIPHERTEXT_FILE) $(SENDER_SECRET)
@@ -167,13 +205,13 @@ encap-pem: build
 	 ./$(BUILD_DIR)/$(BINARY_NAME) -e -in $(PUBKEY_FILE) \
 	   $(if $(PUBKEY_FINGERPRINT),-fingerprint $(PUBKEY_FINGERPRINT))
 
-# 5. Decapsulation on HSM using the private key
+## 5. Decapsulation on HSM using the private key
 decap: build
 	@echo -e "\n=== [5/8] Decapsulating Shared Secret on HSM Server ==="
 	@rm -f $(RECEIVER_SECRET)
 	@$(EXEC_HSM) -d -cipher $(CIPHERTEXT_FILE) -secret $(RECEIVER_SECRET)
 
-# 6. Compare sender and receiver shared secrets
+## 6. Compare sender and receiver shared secrets
 verify:
 	@echo -e "\n=== [6/8] Verifying KEM Shared Secret Agreement ==="
 	@cmp $(SENDER_SECRET) $(RECEIVER_SECRET) && \
@@ -186,6 +224,7 @@ verify:
 
 # WARNING: prints raw key material. For local demo inspection only; deliberately
 # not part of 'demo', and must never run in CI or anywhere output is logged.
+## Print the raw shared secrets (WARNING: key material, local demo use only)
 show-secrets:
 	@echo -e "\033[0;33m[!] WARNING: printing raw shared-secret key material (demo use only; do not log or share)\033[0m"
 	@echo -e "\n--- Sender Shared Secret ---"
@@ -201,7 +240,7 @@ show-secrets:
 # Symmetric AES-256-GCM Targets
 # ----------------------------------------------------------------------------
 
-# Encryption Using Sender Shared Secret (HKDF derivation)
+## 7. Encrypt the payload with the sender shared secret (HKDF + AES-256-GCM)
 sym-enc: build
 	@echo -e "\n=== [7/8] Encrypting Payload (HKDF + AES-256-GCM Sender) ==="
 	@rm -f $(ENC_MSG_FILE)
@@ -214,7 +253,7 @@ sym-enc: build
 	  -in $(PLAIN_MSG_FILE) \
 	  -out $(ENC_MSG_FILE)
 
-# Decryption Using Receiver Shared Secret (HKDF derivation)
+## 8. Decrypt the payload with the receiver shared secret (HKDF + AES-256-GCM)
 sym-dec: build
 	@echo -e "\n=== [8/8] Decrypting Payload (HKDF + AES-256-GCM Receiver) ==="
 	@rm -f $(DEC_MSG_FILE)
@@ -224,7 +263,7 @@ sym-dec: build
 	  -in $(ENC_MSG_FILE) \
 	  -out $(DEC_MSG_FILE)
 
-# Compare Original plaintext with decrypted ciphertext
+## 9. Compare the original plaintext with the decrypted message
 sym-verify:
 	@echo -e "\n=== Verifying Symmetric Payload Integrity ==="
 	@cmp $(PLAIN_MSG_FILE) $(DEC_MSG_FILE) && \
@@ -235,6 +274,7 @@ sym-verify:
 # Complete End-to-End Hybrid PQC Demo Workflow
 # ----------------------------------------------------------------------------
 
+## Full end-to-end pipeline, steps 1-9 (needs a live HSM)
 demo: clean-artifacts conn keygen extract-pk encap-hsm decap verify sym-enc sym-dec sym-verify
 	@echo -e "\n\033[0;32m=======================================================================\033[0m"
 	@echo -e "\033[0;32m[✓] ML-KEM-768 + HKDF-SHA256 + AES-256-GCM Complete Lifecycle Passed!\033[0m"
@@ -244,14 +284,27 @@ demo: clean-artifacts conn keygen extract-pk encap-hsm decap verify sym-enc sym-
 # Cleanup Targets
 # ----------------------------------------------------------------------------
 
+## Delete the demo files (keys, ciphertext, secrets, messages)
 clean-artifacts:
 	@echo "[*] Clearing demo files..."
 	@rm -f $(PUBKEY_FILE) $(CIPHERTEXT_FILE) $(SENDER_SECRET) $(RECEIVER_SECRET) \
 	       $(PLAIN_MSG_FILE) $(ENC_MSG_FILE) $(DEC_MSG_FILE)
 
+## Clear the Go test cache
 clean-cache:
 	@echo "[*] Clearing Go test cache..."
 	go clean -testcache
 
+## Remove the demo files, the test cache and bin/
 clean: clean-artifacts clean-cache
 	@rm -rf $(BUILD_DIR)
+
+# ----------------------------------------------------------------------------
+# Help ('## ' comment directly above a target = its help text)
+# ----------------------------------------------------------------------------
+
+## List targets with their descriptions
+help:
+	@awk '/^## / { desc = substr($$0, 4); next } \
+	     /^[A-Za-z0-9_.-]+:/ && desc != "" { t = $$1; sub(/:.*/, "", t); printf "  %-18s %s\n", t, desc } \
+	     { desc = "" }' $(firstword $(MAKEFILE_LIST))

@@ -17,6 +17,10 @@ make test                      # go test -v ./... with PKCS11_LIB_PATH and BOUNC
 make vulncheck                 # govulncheck ./... (tool installed separately, updated via go-global-update; needs network)
 make staticcheck               # staticcheck ./... (tool installed separately, updated via go-global-update)
 make gosec                     # gosec ./... (tool installed separately, updated via go-global-update)
+make fmt-check                 # fail if any Go file is not gofmt-formatted
+make tidy-check                # go mod tidy -diff (changes nothing); make verify-mods = go mod verify
+make test-race                 # make test with -race
+make help                      # list targets ('## ' comment above a target = its help text)
 make demo                      # full end-to-end pipeline (needs live HSM)
 make run ARGS="-c"             # run the binary with arbitrary flags and the HSM env vars set
 make clean                     # remove artifacts, test cache, bin/
