@@ -43,6 +43,10 @@ ARGS ?= -c
 # Bouncy HSM Configuration String (LogLevel: NONE, INFO, ERROR, SEVERE, FATAL)
 CFG_STRING = Server=$(HSM_HOST); Port=$(HSM_PORT); LogTarget=Console; LogLevel=NONE;
 
+# Extra gosec flags, e.g. GOSEC_FLAGS = -severity=medium
+# (prefer '// #nosec G304 -- reason' in code over excluding a rule globally)
+GOSEC_FLAGS =
+
 # Reusable execution runner macro
 EXEC_HSM = BOUNCY_HSM_CFG_STRING="$(CFG_STRING)" \
            PKCS11_LIB_PATH="$(LIB_PATH)" \
@@ -51,7 +55,7 @@ EXEC_HSM = BOUNCY_HSM_CFG_STRING="$(CFG_STRING)" \
            HSM_PIN_FILE="$(HSM_PIN_FILE)" \
            ./$(BUILD_DIR)/$(BINARY_NAME)
 
-.PHONY: all check-go-version build run test vulncheck staticcheck clean clean-artifacts show-secrets \
+.PHONY: all check-go-version build run test vulncheck staticcheck gosec clean clean-artifacts show-secrets \
         conn keygen extract-pk encap-hsm encap-pem decap verify \
         sym-enc sym-dec sym-verify demo
 
@@ -115,6 +119,14 @@ staticcheck: check-go-version
 	@command -v staticcheck >/dev/null 2>&1 || { \
 		echo "[-] staticcheck not found. Install: go install honnef.co/go/tools/cmd/staticcheck@latest"; exit 1; }
 	staticcheck ./...
+
+# Security scan (gosec is installed and updated separately, e.g. via go-global-update).
+# Accepted findings are marked in code with '// #nosec <rule> -- reason';
+# 'gosec -show-ignored ./...' lists them, 'gosec -nosec ./...' ignores the marks.
+gosec: check-go-version
+	@command -v gosec >/dev/null 2>&1 || { \
+		echo "[-] gosec not found. Install: go install github.com/securego/gosec/v2/cmd/gosec@latest"; exit 1; }
+	gosec $(GOSEC_FLAGS) ./...
 
 # ----------------------------------------------------------------------------
 # ML-KEM Workflow Targets
