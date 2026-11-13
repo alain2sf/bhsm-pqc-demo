@@ -178,12 +178,12 @@ func resolveLibPath(o *options) (string, error) {
 // permissions. O_EXCL refuses to overwrite an existing file (which would keep
 // its old, possibly world-readable mode) or to follow a pre-planted symlink.
 func writeSecretFile(path string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 G703 -- path chosen by the operator (flag or env var) of this local CLI; O_EXCL refuses existing files and symlinks
 	if err != nil {
 		return err
 	}
 	if _, err := f.Write(data); err != nil {
-		f.Close()
+		_ = f.Close() // the write error is the one worth reporting
 		return err
 	}
 	return f.Close()
@@ -345,7 +345,7 @@ func runEncap(o *options, libPath string) error {
 	}
 	defer clear(sharedSecret)
 
-	if err := os.WriteFile(cipherPath, ciphertext, 0644); err != nil {
+	if err := os.WriteFile(cipherPath, ciphertext, 0644); err != nil { // #nosec G306 G703 -- KEM ciphertext is public data; path chosen by the operator (flag or env var) of this local CLI
 		return fmt.Errorf("failed to write ciphertext: %w", err)
 	}
 	if err := writeSecretFile(secretPath, sharedSecret); err != nil {
@@ -369,7 +369,7 @@ func runDecap(o *options, libPath string) error {
 	secretPath := pathOr(o.secretFile, "HSM_SECRET_FILE", "./receiver_secret.bin")
 
 	fmt.Printf("[*] Reading ciphertext from: %s\n", cipherPath)
-	ciphertext, err := os.ReadFile(cipherPath)
+	ciphertext, err := os.ReadFile(cipherPath) // #nosec G304 G703 -- path chosen by the operator (flag or env var) of this local CLI
 	if err != nil {
 		return fmt.Errorf("failed to read ciphertext file '%s': %w", cipherPath, err)
 	}
@@ -402,13 +402,13 @@ func deriveKey(o *options, defaultSecret string) (aesKey, kemCiphertext []byte, 
 	secretPath := pathOr(o.secretFile, "HSM_SECRET_FILE", defaultSecret)
 	cipherPath := pathOr(o.cipherFile, "HSM_CIPHER_FILE", "./ciphertext.bin")
 
-	secret, err := os.ReadFile(secretPath)
+	secret, err := os.ReadFile(secretPath) // #nosec G304 G703 -- path chosen by the operator (flag or env var) of this local CLI
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read secret file '%s': %w", secretPath, err)
 	}
 	defer clear(secret)
 
-	kemCiphertext, err = os.ReadFile(cipherPath)
+	kemCiphertext, err = os.ReadFile(cipherPath) // #nosec G304 G703 -- path chosen by the operator (flag or env var) of this local CLI
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read KEM ciphertext file '%s' (bound into the AEAD tag): %w", cipherPath, err)
 	}
@@ -434,7 +434,7 @@ func runSymEnc(o *options) error {
 	}
 	defer clear(aesKey)
 
-	plaintext, err := os.ReadFile(plainPath)
+	plaintext, err := os.ReadFile(plainPath) // #nosec G304 G703 -- path chosen by the operator (flag or env var) of this local CLI
 	if err != nil {
 		return fmt.Errorf("failed to read plaintext input file '%s': %w", plainPath, err)
 	}
@@ -445,7 +445,7 @@ func runSymEnc(o *options) error {
 		return fmt.Errorf("encryption failed: %w", err)
 	}
 
-	if err := os.WriteFile(outPath, encrypted, 0644); err != nil {
+	if err := os.WriteFile(outPath, encrypted, 0644); err != nil { // #nosec G306 G703 -- AES-256-GCM output is already encrypted; path chosen by the operator (flag or env var) of this local CLI
 		return fmt.Errorf("failed to write encrypted output: %w", err)
 	}
 
@@ -466,7 +466,7 @@ func runSymDec(o *options) error {
 	}
 	defer clear(aesKey)
 
-	encrypted, err := os.ReadFile(encPath)
+	encrypted, err := os.ReadFile(encPath) // #nosec G304 G703 -- path chosen by the operator (flag or env var) of this local CLI
 	if err != nil {
 		return fmt.Errorf("failed to read encrypted input file '%s': %w", encPath, err)
 	}

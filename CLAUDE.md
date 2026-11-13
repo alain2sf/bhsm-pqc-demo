@@ -16,6 +16,11 @@ make build                     # tidy + vet + build bin/bhsm-pqc-demo
 make test                      # go test -v ./... with PKCS11_LIB_PATH and BOUNCY_HSM_CFG_STRING exported
 make vulncheck                 # govulncheck ./... (tool installed separately, updated via go-global-update; needs network)
 make staticcheck               # staticcheck ./... (tool installed separately, updated via go-global-update)
+make gosec                     # gosec ./... (tool installed separately, updated via go-global-update)
+make fmt-check                 # fail if any Go file is not gofmt-formatted
+make tidy-check                # go mod tidy -diff (changes nothing); make verify-mods = go mod verify
+make test-race                 # make test with -race
+make help                      # list targets ('## ' comment above a target = its help text)
 make demo                      # full end-to-end pipeline (needs live HSM)
 make run ARGS="-c"             # run the binary with arbitrary flags and the HSM env vars set
 make clean                     # remove artifacts, test cache, bin/
@@ -53,6 +58,8 @@ Public key fingerprints are `SHA256:` + hex SHA-256 of the **canonical** DER SPK
 Behavior to know about: `-g` generates the new pair first, then **deletes every other public, private and secret key object with the same label**. Key lookups (`findUniqueMLKEMKey`) filter on `CKK_ML_KEM` and refuse a label with more than one match, so a leftover or planted duplicate makes encap and decap fail rather than pick the wrong key.
 
 ## Repo notes
+
+- `make gosec` reports no issues: each accepted finding carries a `// #nosec <rule> -- reason` comment (G304/G703 for operator-chosen paths, G306 for `0644` writes of public or encrypted data). New file I/O must either pass gosec or get such a comment with its rule IDs named and a real reason, never a bare `#nosec`. Secrets and plaintext still go through `writeSecretFile`.
 
 - `DemoSlotToken1.pin` holds the token user PIN and is gitignored. Don't commit it or print its contents. `hsm.ReadPINFile` refuses it unless its mode is owner-only (e.g. `0600`).
 - The README documents an equivalent `openssl ... -provider pkcs11prov` command for each pipeline step. Use them to cross-check behavior.

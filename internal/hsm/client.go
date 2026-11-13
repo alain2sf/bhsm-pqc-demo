@@ -312,7 +312,7 @@ func ReadPINFile(path string) (string, error) {
 		return "", fmt.Errorf("PIN file '%s' has permissions %04o; it must not be accessible by group or others (run: chmod 600 %s)", path, perm, path)
 	}
 
-	pinBytes, err := os.ReadFile(path)
+	pinBytes, err := os.ReadFile(path) // #nosec G304 -- HSM_PIN_FILE set by the operator; owner-only mode checked above
 	if err != nil {
 		return "", fmt.Errorf("could not read PIN file '%s': %w", path, err)
 	}
@@ -556,7 +556,7 @@ func (c *Client) ExportPublicKeyPEM(tokenLabel, objectLabel, pinFilePath, output
 	fmt.Printf("[*] Extracted %s raw public key (%d bytes)\n", algName, len(rawPubKey))
 	fmt.Printf("[*] Fingerprint  : %s\n", fingerprint)
 
-	if err := os.WriteFile(outputPath, pemBytes, 0644); err != nil {
+	if err := os.WriteFile(outputPath, pemBytes, 0644); err != nil { // #nosec G306 -- a public key, meant to be shared
 		return fmt.Errorf("failed to write PEM output to '%s': %w", outputPath, err)
 	}
 
@@ -672,7 +672,7 @@ func EncapsulateFromPEM(pemPath string) (ciphertext []byte, sharedSecret []byte,
 // raw encapsulation key after strict structural checks (no trailing DER, absent
 // parameters, whole-byte BIT STRING, OID matching the key length).
 func ReadPublicKeyPEM(pemPath string) ([]byte, error) {
-	pemData, err := os.ReadFile(pemPath)
+	pemData, err := os.ReadFile(pemPath) // #nosec G304 -- path chosen by the caller (CLI flag or env var); contents strictly validated below
 	if err != nil {
 		return nil, fmt.Errorf("failed to read public key PEM file '%s': %w", pemPath, err)
 	}

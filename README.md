@@ -324,6 +324,34 @@ make staticcheck
 
 It runs offline and is deliberately not part of `make build` or `make test`.
 
+### Security Scan (`make gosec`)
+
+`make gosec` runs [`gosec`](https://github.com/securego/gosec) over the whole module (`gosec ./...`). Its rules map to CWEs: path traversal, file permissions, unchecked errors, weak crypto and more. Test files are not scanned. The tool is not managed by the project. Install it once, and update it with `go-global-update`:
+
+```bash
+go install github.com/securego/gosec/v2/cmd/gosec@latest
+make gosec
+```
+
+The current findings are all reviewed and accepted in the code with `// #nosec <rule> -- reason` comments, so the scan reports no issues. They are:
+
+- **G304 / G703** (path from a variable, CWE-22): file paths come from flags or environment variables set by whoever runs this local CLI.
+- **G306** (`0644` writes, CWE-276): the KEM ciphertext, the AES-256-GCM output and the public key PEM are public or already encrypted. Secrets and plaintext go through `writeSecretFile` (`0600`, `O_EXCL`).
+
+Rules are always named in a `#nosec`, so other rules still apply to that line. `gosec -show-ignored ./...` lists the accepted findings, and `gosec -nosec ./...` ignores the comments to show the raw report. Extra flags go in `GOSEC_FLAGS` (e.g. `make gosec GOSEC_FLAGS=-severity=high`). It runs offline and is deliberately not part of `make build` or `make test`.
+
+### Other Checks
+
+```bash
+make fmt-check     # fail if any Go file is not gofmt-formatted (fix: gofmt -w .)
+make tidy-check    # go mod tidy -diff: fail if go.mod/go.sum are not tidy; changes nothing
+make verify-mods   # go mod verify: downloaded modules match go.sum
+make test-race     # make test with the race detector
+make help          # list all targets
+```
+
+`verify-mods` is not called `verify` because `make verify` is step 6, the KEM shared-secret check.
+
 ---
 
 ## 8. CLI Reference & Help Screen
